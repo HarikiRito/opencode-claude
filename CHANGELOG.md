@@ -1,7 +1,16 @@
 # Changelog
 
-## Unreleased
+## 0.11.0
 
+- **Retry on mid-run limits (both directions)**: the subscription-limit retry
+  now fires not only when a new user request is captured (429 + `Retry-After`
+  from the gate) but also when the limit lands mid-turn while the agent is
+  already responding. A mid-run `error: "rate_limit"` synthetic assistant
+  event, error result, or iterator throw records the reset into the shared
+  store and surfaces a retryable OpenAI stream error (or a truthful 429 for
+  buffered turns), so OpenCode's session retry policy re-runs the turn, reads
+  the stored `Retry-After`, and resumes after the countdown — previously the
+  run just died with the error as its last message.
 - **Connection reset retries**: OpenCode's "Connection reset by server" on
   Claude turns was Bun.serve's default 10s `idleTimeout` killing the socket
   while the proxy probed for first content (no HTTP bytes yet) or while the
@@ -15,6 +24,10 @@
   activate the shared gate immediately and emit a retryable OpenAI stream
   error; OpenCode's retry receives the stored 429 + `Retry-After`, so the reset
   timer starts even when no new user request is made.
+- **Test isolation**: the proxy history-injection tests read the host's real
+  `rate-limit.json`, so a live confirmed limit on the dev machine gated the
+  mocked healthy turns into spurious 429s. The block now uses its own temp
+  rate-limit store.
 
 ## 0.9.1
 

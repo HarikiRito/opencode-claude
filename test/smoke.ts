@@ -1136,9 +1136,21 @@ async function main() {
       getForeignSessionId,
       setForeignSessionId,
     } = await import("../src/session-store.ts");
-    const { mkdirSync, rmSync, writeFileSync } = await import("node:fs");
-    const { homedir } = await import("node:os");
+    const { mkdirSync, rmSync, writeFileSync, mkdtempSync } = await import(
+      "node:fs"
+    );
+    const { homedir, tmpdir } = await import("node:os");
     const { join: joinPath } = await import("node:path");
+
+    // Isolate the rate-limit store: this block mocks healthy turns, so a
+    // confirmed limit in the HOST's real store (e.g. the dev machine is
+    // actually rate-limited right now) must not gate them into 429s.
+    const histTmpDir = mkdtempSync(joinPath(tmpdir(), "oc-claude-hist-"));
+    const histPrevStoreEnv = process.env.OPENCODE_CLAUDE_RATE_LIMIT_STORE;
+    process.env.OPENCODE_CLAUDE_RATE_LIMIT_STORE = joinPath(
+      histTmpDir,
+      "rate-limit.json",
+    );
 
     const mockTurn = (
       seen: { params: Record<string, unknown> | null },
@@ -1248,6 +1260,12 @@ async function main() {
       clearForeignSessionId("smoke-history-dead");
     } finally {
       setClaudeQueryStarter(null);
+      if (histPrevStoreEnv === undefined) {
+        delete process.env.OPENCODE_CLAUDE_RATE_LIMIT_STORE;
+      } else {
+        process.env.OPENCODE_CLAUDE_RATE_LIMIT_STORE = histPrevStoreEnv;
+      }
+      rmSync(histTmpDir, { recursive: true, force: true });
     }
   }
 
