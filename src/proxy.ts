@@ -85,6 +85,15 @@ import {
 const SHARED_PROXY_HEALTH_TIMEOUT_MS = 750;
 
 /**
+ * Bun.serve defaults to 10s and RSTs idle sockets. OpenCode maps that to a
+ * retryable "Connection reset by server". This proxy holds the HTTP response
+ * until the Claude turn proves alive, and SSE can pause during thinking —
+ * both exceed 10s easily. 0 disables the timer (same as OpenCode's adapter).
+ */
+export const PROXY_IDLE_TIMEOUT_SECONDS = 0;
+export const SSE_HEARTBEAT_MS = 5_000;
+
+/**
  * Optional pinned port via OPENCODE_CLAUDE_PROXY_PORT.
  * Default is `0` — Bun binds an ephemeral free port; the live URL is then
  * published through the config hook + auth loader so OpenCode always hits the
@@ -232,6 +241,7 @@ export async function startProxy(tokenProvider: TokenProvider): Promise<number> 
     server = Bun.serve({
       hostname,
       port: bindPort,
+      idleTimeout: PROXY_IDLE_TIMEOUT_SECONDS,
       async fetch(req) {
         return handleRequest(req);
       },
@@ -1016,7 +1026,13 @@ async function collectTurnResponse(
 
   const usage = resolveTurnUsage(turnUsage, resultUsage);
 
-  if (!sawContent && errorText) {
+  // Buffered responses have not committed HTTP headers yet. Even if an agent
+  // produced partial work first, preserve the real 429 so OpenCode starts its
+  // retry countdown instead of treating the run as a successful answer.
+  if (
+    errorText &&
+    (!sawContent || classifyClaudeFailure(errorText) === "rate_limit")
+  ) {
     return failureResponse(errorText, bridge.conversationKey);
   }
 
@@ -1063,7 +1079,9 @@ function rawProbeKind(event: unknown): "content" | "error" | "neutral" {
   if (!event || typeof event !== "object") return "neutral";
   const e = event as Record<string, unknown>;
   if (e.type === "__park__") return "content";
-  if (e.type === "assistant") return "content";
+  if (e.type === "assistant") {
+    return assistantErrorText(e) ? "error" : "content";
+  }
   if (e.type === "result") return e.is_error ? "error" : "content";
   if (e.type === "stream_event" && e.event && typeof e.event === "object") {
     const ev = e.event as Record<string, unknown>;
@@ -1099,6 +1117,8 @@ function rawProbeKind(event: unknown): "content" | "error" | "neutral" {
 
 function rawErrorText(event: unknown): string {
   const e = (event ?? {}) as Record<string, unknown>;
+  const assistantText = assistantErrorText(e);
+  if (assistantText) return assistantText;
   if (typeof e.result === "string" && e.result) return e.result;
   if (typeof e.error === "string" && e.error) return e.error;
   return "Claude turn failed";
@@ -1182,12 +1202,15 @@ function failureResponse(
         ? Math.max(1, Math.round((until - Date.now()) / 1000))
         : 600;
     const countdown = formatResetCountdown(retryAfterSeconds * 1000);
+    const message = /\blimit resets in\b/i.test(errorText)
+      ? errorText
+      : `${errorText} · limit resets in ${countdown}${
+          snap.resetsAtISO ? ` (${snap.resetsAtISO})` : ""
+        }`;
     return Response.json(
       {
         error: {
-          message: `${errorText} · limit resets in ${countdown}${
-            snap.resetsAtISO ? ` (${snap.resetsAtISO})` : ""
-          }`,
+          message,
           type: failureTypeFor(kind),
           code: "claude_session_limit",
           ...(snap.resetsAt !== undefined
@@ -1247,6 +1270,21 @@ function streamOpenAIResponse(
         );
       };
 
+      // Keep the socket busy during thinking pauses. Complements idleTimeout: 0
+      // for any hop that still kills silent SSE connections.
+      let streamClosed = false;
+      const heartbeat = setInterval(() => {
+        if (streamClosed) return;
+        try {
+          controller.enqueue(encoder.encode(": ping\n\n"));
+        } catch {
+          streamClosed = true;
+          clearInterval(heartbeat);
+        }
+      }, SSE_HEARTBEAT_MS);
+      heartbeat.unref?.();
+
+      try {
       send({
         id: completionId,
         object: "chat.completion.chunk",
@@ -1263,6 +1301,28 @@ function streamOpenAIResponse(
         const norm = normalizeClaudeErrorText(text);
         if (!norm || norm === lastErrorNorm) return;
         lastErrorNorm = norm;
+        if (classifyClaudeFailure(text) === "rate_limit") {
+          // The HTTP head is already committed after earlier agent output, so
+          // a late 429 is impossible. Send an OpenAI-compatible stream error.
+          // Its JSON-string message is understood by OpenCode's stream-error
+          // parser as retryable; the first retry then hits our 429 gate with
+          // the real Retry-After and switches the UI to the reset countdown.
+          send({
+            error: {
+              message: JSON.stringify({
+                type: "error",
+                error: {
+                  type: "server_error",
+                  code: "server_error",
+                  message: text,
+                },
+              }),
+              type: "error",
+              code: "claude_session_limit",
+            },
+          });
+          return;
+        }
         send({
           id: completionId,
           object: "chat.completion.chunk",
@@ -1393,6 +1453,10 @@ function streamOpenAIResponse(
       });
       controller.enqueue(encoder.encode("data: [DONE]\n\n"));
       controller.close();
+      } finally {
+        streamClosed = true;
+        clearInterval(heartbeat);
+      }
     },
   });
 
@@ -1407,6 +1471,27 @@ type MappedEvent =
   | { kind: "usage-delta"; usage: OpenAIUsage }
   | { kind: "error"; text: string; usage?: OpenAIUsage | null }
   | { kind: "ignore" };
+
+/** Text carried by Claude's synthetic assistant API-error message. */
+function assistantErrorText(event: Record<string, unknown>): string | null {
+  if (event.error !== "rate_limit") return null;
+  const message = event.message;
+  if (!message || typeof message !== "object") return null;
+  const content = (message as { content?: unknown }).content;
+  if (!Array.isArray(content)) return null;
+  const text = content
+    .filter(
+      (block): block is { type: "text"; text: string } =>
+        !!block &&
+        typeof block === "object" &&
+        (block as { type?: unknown }).type === "text" &&
+        typeof (block as { text?: unknown }).text === "string",
+    )
+    .map((block) => block.text)
+    .join("\n")
+    .trim();
+  return text || "Claude session/usage limit reached";
+}
 
 /** claude CLI text when `resume` points at a session it cannot load. */
 const LOST_SESSION_PATTERN =
@@ -1493,6 +1578,26 @@ function mapSdkEvent(event: unknown): MappedEvent {
   // `result` event only arrives after the final continuation.
   if (e.type === "assistant") {
     const usage = usageFromAssistantEvent(event);
+    // During a multi-step Agent SDK run, Claude can exhaust the subscription
+    // on the API call after a tool result. The CLI emits that as a synthetic
+    // assistant message (`error: "rate_limit"`) before the terminal result.
+    // Record it immediately: the HTTP response is already streaming, so only
+    // this event can activate the shared countdown/gate in time.
+    const errorText = assistantErrorText(e);
+    if (errorText) {
+      const limited = recordRateLimitErrorText(errorText);
+      let note = errorText;
+      const until = limited?.limitedUntil ?? limited?.resetsAt;
+      if (until !== undefined) {
+        const wait = formatResetCountdown(Math.max(0, until - Date.now()));
+        note = `${errorText} · limit resets in ${wait}${
+          limited?.resetsAt
+            ? ` (${new Date(limited.resetsAt).toISOString()})`
+            : ""
+        }`;
+      }
+      return { kind: "error", text: note, usage };
+    }
     if (usage) return { kind: "usage-delta", usage };
     return { kind: "ignore" };
   }

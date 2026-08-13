@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- **Connection reset retries**: OpenCode's "Connection reset by server" on
+  Claude turns was Bun.serve's default 10s `idleTimeout` killing the socket
+  while the proxy probed for first content (no HTTP bytes yet) or while the
+  model thought. The listener now disables idle timeout (same as OpenCode's
+  own server) and SSE streams emit comment heartbeats during long pauses.
+- **Mid-run limit countdown**: when an Agent SDK run exhausted the Claude
+  subscription after earlier text or tool work, the synthetic assistant
+  `error: "rate_limit"` event was treated as ordinary assistant content. The
+  limit store was eventually updated, but OpenCode saw a successful stream and
+  never entered its retry/countdown state. Synthetic rate-limit events now
+  activate the shared gate immediately and emit a retryable OpenAI stream
+  error; OpenCode's retry receives the stored 429 + `Retry-After`, so the reset
+  timer starts even when no new user request is made.
+
 ## 0.9.1
 
 - **Fail-fast on dead turns**: a Claude turn that dies before producing any

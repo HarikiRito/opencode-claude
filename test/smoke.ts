@@ -47,6 +47,7 @@ async function main() {
     stopProxy,
     getProxyPort,
     getClaudeProxyBaseUrl,
+    PROXY_IDLE_TIMEOUT_SECONDS,
   } = await import("../src/proxy.ts");
 
   // PKCE
@@ -579,6 +580,9 @@ async function main() {
   assert.ok(port > 0);
   assert.equal(getProxyPort(), port);
   assert.ok(getClaudeProxyBaseUrl().includes(String(port)));
+  // Bun's default 10s idleTimeout RSTs the socket while we probe the Claude
+  // turn (no HTTP bytes until first content). 0 disables, matching OpenCode.
+  assert.equal(PROXY_IDLE_TIMEOUT_SECONDS, 0);
 
   const health = await fetch(`http://127.0.0.1:${port}/health`);
   assert.equal(health.status, 200);
@@ -1005,6 +1009,95 @@ async function main() {
       assert.ok((limitedBody.resetInSeconds ?? 0) > 0);
       assert.match(limitedBody.message ?? "", /session limit/);
 
+      // Regression: if the limit is exhausted after the run already produced
+      // content/tool work, Claude emits a synthetic assistant API-error event.
+      // There is no new user request to trigger the pre-flight gate, so this
+      // event itself must activate the timer immediately.
+      rmSync(storeFile, { force: true });
+      const midRunLimitText =
+        "You've hit your session limit · resets 1:10am (Europe/Kyiv)";
+      setClaudeQueryStarter(async () => ({
+        stream: (async function* () {
+          yield { type: "system", subtype: "init", session_id: "mock-sess-mid-run" };
+          yield {
+            type: "stream_event",
+            event: {
+              type: "content_block_delta",
+              delta: { type: "text_delta", text: "work completed before limit" },
+            },
+          };
+          yield {
+            type: "assistant",
+            error: "rate_limit",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: midRunLimitText }],
+              usage: { input_tokens: 0, output_tokens: 0 },
+            },
+          };
+        })(),
+        interrupt: async () => {},
+        close: () => {},
+        getPid: () => null,
+      }));
+
+      const midRunRes = await fetch(
+        `http://127.0.0.1:${port}/v1/chat/completions`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-opencode-claude-session": "smoke-mock-mid-run-limit",
+          },
+          body: JSON.stringify({
+            model: "sonnet",
+            stream: true,
+            messages: [{ role: "user", content: "keep working" }],
+          }),
+        },
+      );
+      assert.equal(midRunRes.status, 200);
+      const midRunBody = await midRunRes.text();
+      assert.match(midRunBody, /work completed before limit/);
+      assert.match(midRunBody, /claude_session_limit/);
+      assert.match(midRunBody, /server_error/);
+      assert.doesNotMatch(midRunBody, /\[claude-code error\]/);
+      assert.match(midRunBody, /limit resets in/);
+
+      const midRunSnapshot = getRateLimitSnapshot();
+      assert.equal(midRunSnapshot.limited, true);
+      assert.ok((midRunSnapshot.resetInSeconds ?? 0) > 0);
+      const midRunCounter = await fetch(
+        `http://127.0.0.1:${port}/v1/rate-limit`,
+      );
+      const midRunCounterBody = (await midRunCounter.json()) as {
+        limited?: boolean;
+        resetInSeconds?: number;
+      };
+      assert.equal(midRunCounterBody.limited, true);
+      assert.ok((midRunCounterBody.resetInSeconds ?? 0) > 0);
+
+      // The stream error makes OpenCode retry once; that retry must receive
+      // the stored reset as a real 429 + Retry-After, which drives the timer.
+      const midRunRetry = await fetch(
+        `http://127.0.0.1:${port}/v1/chat/completions`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-opencode-claude-session": "smoke-mock-mid-run-limit",
+          },
+          body: JSON.stringify({
+            model: "sonnet",
+            stream: true,
+            messages: [{ role: "user", content: "keep working" }],
+          }),
+        },
+      );
+      assert.equal(midRunRetry.status, 429);
+      assert.ok(midRunRetry.headers.get("retry-after"));
+      assert.match(await midRunRetry.text(), /limit resets in/);
+
       // Gate env kill-switch
       process.env.OPENCODE_CLAUDE_RATE_LIMIT_FAST_FAIL = "0";
       assert.equal(rateLimitGate().blocked, false);
@@ -1311,6 +1404,39 @@ async function main() {
       assert.equal(noCredJson.error?.code, "claude_auth_required");
       assert.equal(starterCalled, false, "no doomed turn was spawned");
       setClaudeCredentialProbe(() => true);
+
+      // First content after Bun's default 10s idleTimeout must not RST.
+      // OpenCode surfaces that as retryable "Connection reset by server".
+      setClaudeQueryStarter(async () => ({
+        stream: (async function* () {
+          await new Promise((r) => setTimeout(r, 11_000));
+          yield {
+            type: "stream_event",
+            event: {
+              type: "content_block_delta",
+              delta: { type: "text_delta", text: "SLOW_OK" },
+            },
+          };
+          yield { type: "result", is_error: false, usage: {} };
+        })(),
+        interrupt: async () => {},
+        close: () => {},
+        getPid: () => null,
+      }));
+      const slowStarted = Date.now();
+      const slowRes = await postTurn("ff-slow-first-byte", true);
+      assert.equal(
+        slowRes.status,
+        200,
+        "probe longer than Bun's 10s default must not RST the socket",
+      );
+      const slowBody = await slowRes.text();
+      assert.match(slowBody, /SLOW_OK/);
+      assert.match(slowBody, /\[DONE\]/);
+      assert.ok(
+        Date.now() - slowStarted >= 11_000,
+        "slow-first-byte test did not actually wait out the default idleTimeout",
+      );
     } finally {
       setClaudeQueryStarter(null);
       setClaudeCredentialProbe(null);
