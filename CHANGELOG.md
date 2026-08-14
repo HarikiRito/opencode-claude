@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.11.1
+
+- **Accurate usage for parallel tools**: Claude Agent SDK replays the same
+  assistant message while parallel MCP tool results arrive. The plugin now
+  counts each SDK assistant message ID once per parked turn, preventing token
+  usage from alternating between the real value and an inflated multiple.
+
 ## 0.11.0
 
 - **Retry on mid-run limits (both directions)**: the subscription-limit retry

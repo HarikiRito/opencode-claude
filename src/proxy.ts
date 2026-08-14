@@ -74,7 +74,7 @@ import {
   requestKeyNamespace,
 } from "./request-kind.js";
 import {
-  addOpenAIUsage,
+  addUniqueAssistantUsage,
   formatCompactNote,
   resolveTurnUsage,
   usageFromAssistantEvent,
@@ -750,6 +750,7 @@ async function handleChatCompletions(
     conversationKey,
     handle,
     pendingTools,
+    seenAssistantUsageIds: new Set(),
     createdAt: Date.now(),
   };
   putBridge(bridge);
@@ -1006,7 +1007,12 @@ async function collectTurnResponse(
       } else if (mapped.kind === "reasoning") {
         if (!suppressReasoning) reasoning += mapped.text;
       } else if (mapped.kind === "usage-delta") {
-        turnUsage = addOpenAIUsage(turnUsage, mapped.usage);
+        turnUsage = addUniqueAssistantUsage(
+          turnUsage,
+          mapped.usage,
+          mapped.messageId,
+          bridge.seenAssistantUsageIds,
+        );
       } else if (mapped.kind === "usage") {
         resultUsage = mapped.usage;
       } else if (mapped.kind === "error") {
@@ -1408,7 +1414,12 @@ function streamOpenAIResponse(
           }
 
           if (mapped.kind === "usage-delta") {
-            turnUsage = addOpenAIUsage(turnUsage, mapped.usage);
+            turnUsage = addUniqueAssistantUsage(
+              turnUsage,
+              mapped.usage,
+              mapped.messageId,
+              bridge.seenAssistantUsageIds,
+            );
           }
 
           if (mapped.kind === "usage") {
@@ -1468,7 +1479,7 @@ type MappedEvent =
   | { kind: "reasoning"; text: string }
   | { kind: "park"; tools: ParkedToolCall[] }
   | { kind: "usage"; usage: OpenAIUsage }
-  | { kind: "usage-delta"; usage: OpenAIUsage }
+  | { kind: "usage-delta"; usage: OpenAIUsage; messageId: string | null }
   | { kind: "error"; text: string; usage?: OpenAIUsage | null }
   | { kind: "ignore" };
 
@@ -1577,6 +1588,10 @@ function mapSdkEvent(event: unknown): MappedEvent {
   // is the only usage signal available for parked (tool-call) turns — their
   // `result` event only arrives after the final continuation.
   if (e.type === "assistant") {
+    const message =
+      e.message && typeof e.message === "object"
+        ? (e.message as Record<string, unknown>)
+        : null;
     const usage = usageFromAssistantEvent(event);
     // During a multi-step Agent SDK run, Claude can exhaust the subscription
     // on the API call after a tool result. The CLI emits that as a synthetic
@@ -1598,7 +1613,13 @@ function mapSdkEvent(event: unknown): MappedEvent {
       }
       return { kind: "error", text: note, usage };
     }
-    if (usage) return { kind: "usage-delta", usage };
+    if (usage) {
+      return {
+        kind: "usage-delta",
+        usage,
+        messageId: typeof message?.id === "string" ? message.id : null,
+      };
+    }
     return { kind: "ignore" };
   }
 

@@ -196,6 +196,20 @@ export function addOpenAIUsage(
   };
 }
 
+/** Count a replayed SDK assistant message only once across tool continuations. */
+export function addUniqueAssistantUsage(
+  acc: OpenAIUsage | null,
+  delta: OpenAIUsage,
+  messageId: string | null,
+  seen: Set<string>,
+): OpenAIUsage | null {
+  if (messageId) {
+    if (seen.has(messageId)) return acc;
+    seen.add(messageId);
+  }
+  return addOpenAIUsage(acc, delta);
+}
+
 /**
  * Combine the per-response accumulated usage (one entry per Anthropic API
  * call seen during this HTTP response) with the SDK `result` snapshot.

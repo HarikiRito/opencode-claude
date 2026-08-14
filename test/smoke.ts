@@ -395,6 +395,7 @@ async function main() {
   const {
     usageFromAssistantEvent,
     addOpenAIUsage,
+    addUniqueAssistantUsage,
     resolveTurnUsage,
   } = await import("../src/usage.ts");
   const callUsage = usageFromAssistantEvent({
@@ -429,6 +430,28 @@ async function main() {
   assert.equal(summed.total_tokens, 1065);
   assert.equal(summed.prompt_tokens_details?.cached_tokens, 907);
   assert.equal(summed.prompt_tokens_details?.cache_write_tokens, 30);
+
+  const seenAssistantUsageIds = new Set<string>();
+  const firstUnique = addUniqueAssistantUsage(
+    null,
+    callUsage!,
+    "sdk-message-1",
+    seenAssistantUsageIds,
+  );
+  const replayed = addUniqueAssistantUsage(
+    firstUnique,
+    callUsage!,
+    "sdk-message-1",
+    seenAssistantUsageIds,
+  );
+  assert.deepEqual(replayed, firstUnique);
+  const secondUnique = addUniqueAssistantUsage(
+    replayed,
+    callUsage!,
+    "sdk-message-2",
+    seenAssistantUsageIds,
+  );
+  assert.equal(secondUnique?.total_tokens, callUsage!.total_tokens * 2);
 
   // Accumulated per-response usage wins over the cumulative result snapshot
   // (which would double-count prior turns of a continued Claude query), but
