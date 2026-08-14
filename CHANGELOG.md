@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- **Claude CLI-owned authentication**: removed the plugin's browser OAuth,
+  credential-file parsing, token copying, token refresh, and OAuth environment
+  injection. The plugin no longer writes an OpenCode connection marker; the
+  official Claude Code CLI exclusively owns and reads its credentials. The
+  provider sign-in action launches `claude auth login --claudeai`, so users can
+  still complete the official browser flow from OpenCode/OpenChamber.
+- **Agent SDK-only inference**: title and summary generation now follows the
+  same Agent SDK / Claude Code path as normal chats. The plugin no longer sends
+  direct requests to Anthropic inference or OAuth endpoints.
+
 ## 0.11.1
 
 - **Accurate usage for parallel tools**: Claude Agent SDK replays the same

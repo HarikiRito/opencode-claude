@@ -2,7 +2,7 @@
  * Live Haiku matrix for opencode-claude.
  *
  * Exclusive model: haiku (claude-haiku-4-5) with effort=high.
- * Requires CLAUDE_CODE_OAUTH_TOKEN (or Claude CLI login) + network.
+ * Requires a logged-in Claude Code CLI + network.
  *
  * Run: bun test/haiku-live.ts
  */
@@ -20,6 +20,7 @@ import {
   getClaudeProxyBaseUrl,
 } from "../src/proxy.ts";
 import { EFFORT_HEADER, SESSION_HEADER } from "../src/constants.ts";
+import { detectClaudeCode } from "../src/detect.ts";
 
 type CaseResult = {
   id: string;
@@ -210,15 +211,15 @@ async function main() {
     return { detail: note.trim() };
   });
 
-  const token = process.env.CLAUDE_CODE_OAUTH_TOKEN?.trim();
-  if (!token) {
-    console.error("SKIP live cases — CLAUDE_CODE_OAUTH_TOKEN not set");
+  const detection = await detectClaudeCode();
+  if (!detection.loggedIn) {
+    console.error("SKIP live cases — Claude Code CLI is not logged in");
     printSummary();
     process.exit(RESULTS.some((r) => !r.ok) ? 1 : 0);
   }
 
   await stopProxy();
-  await startProxy(async () => token);
+  await startProxy();
 
   // Health
   await runCase("proxy.health_models", async () => {
@@ -721,7 +722,7 @@ async function main() {
     assert.match(out, /OC_CLI_IMAGE_OK/);
     assert.match(out, /red/i);
     // Restart proxy for any later cases (none currently)
-    await startProxy(async () => token);
+    await startProxy();
     return { detail: "opencode --file PNG OK" };
   });
 

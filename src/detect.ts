@@ -3,7 +3,6 @@
  */
 import { spawnSync } from "node:child_process";
 import { buildClaudeCodeChildEnv } from "./auth-env.js";
-import { hasClaudeCliOAuthCredentials } from "./credentials.js";
 import { findBinaryOnPath } from "./executable-path.js";
 import { probeClaudeAgentSdk } from "./query.js";
 
@@ -151,15 +150,13 @@ export async function detectClaudeCode(options?: {
   }
 
   const authStatus = probeClaudeAuthStatusCli({ binaryPath, env });
-  const loggedIn =
-    Boolean(authStatus?.loggedIn) ||
-    hasClaudeCliOAuthCredentials({ homeDir: options?.homeDir, env });
+  const loggedIn = Boolean(authStatus?.loggedIn);
 
   if (!loggedIn) {
     return {
       status: "needs-login",
       statusDetail:
-        "Claude Code is installed but not logged in with a subscription. Run `claude auth login` or use plugin OAuth.",
+        "Claude Code is installed but not logged in with a subscription. Run `claude auth login`.",
       binaryPath,
       version,
       sdkAvailable: true,

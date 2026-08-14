@@ -3,21 +3,10 @@
  */
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { EventEmitter } from "node:events";
 
 async function main() {
-  const {
-    authorizeClaudeMax,
-    RefreshTokenInvalidError,
-  } = await import("../src/auth.ts");
-  const { generatePKCE } = await import("../src/pkce.ts");
-  const {
-    extractClaudeOAuthCredentials,
-    listClaudeCredentialsCandidates,
-    readClaudeCodeOAuthTokenFromEnv,
-  } = await import("../src/credentials.ts");
-  const { buildClaudeCodeChildEnv, withClaudeOAuthToken } = await import(
-    "../src/auth-env.ts"
-  );
+  const { buildClaudeCodeChildEnv } = await import("../src/auth-env.ts");
   const {
     interpretClaudeAuthStatus,
   } = await import("../src/detect.ts");
@@ -25,7 +14,6 @@ async function main() {
     CLAUDE_CODE_MODELS,
     buildEffortVariants,
     getClaudeModels,
-    isLoginPlaceholderModel,
     resolveClaudeModelId,
   } = await import("../src/models.ts");
   const {
@@ -50,55 +38,69 @@ async function main() {
     PROXY_IDLE_TIMEOUT_SECONDS,
   } = await import("../src/proxy.ts");
 
-  // PKCE
-  const pkce = await generatePKCE();
-  assert.equal(typeof pkce.verifier, "string");
-  assert.ok(pkce.verifier.length > 20);
-  assert.equal(typeof pkce.challenge, "string");
-
-  // OAuth authorize URL
-  const auth = await authorizeClaudeMax();
-  assert.ok(auth.url.includes("claude.ai/oauth/authorize"));
-  assert.ok(auth.url.includes("client_id="));
-  assert.ok(auth.verifier);
-  assert.ok(auth.state);
-
-  // Credentials parsing
-  const extracted = extractClaudeOAuthCredentials({
-    claudeAiOauth: {
-      accessToken: "access-xyz",
-      refreshToken: "refresh-xyz",
-      expiresAt: Date.now() + 60_000,
-      scopes: ["user:inference"],
-    },
-  });
-  assert.equal(extracted?.accessToken, "access-xyz");
-  assert.equal(extracted?.refreshToken, "refresh-xyz");
-  const candidates = listClaudeCredentialsCandidates();
-  assert.ok(Array.isArray(candidates));
-  assert.ok(candidates.length > 0);
-
-  assert.equal(
-    readClaudeCodeOAuthTokenFromEnv({ CLAUDE_CODE_OAUTH_TOKEN: " tok " }),
-    "tok",
-  );
-  assert.equal(readClaudeCodeOAuthTokenFromEnv({}), null);
-
   // Auth env stripping
   const cleaned = buildClaudeCodeChildEnv({
     PATH: "/usr/bin",
     ANTHROPIC_API_KEY: "sk-secret",
     ANTHROPIC_AUTH_TOKEN: "tok",
+    CLAUDE_CODE_OAUTH_TOKEN: "oauth-token",
     KEEP: "1",
   });
   assert.equal(cleaned.ANTHROPIC_API_KEY, undefined);
   assert.equal(cleaned.ANTHROPIC_AUTH_TOKEN, undefined);
+  assert.equal(cleaned.CLAUDE_CODE_OAUTH_TOKEN, undefined);
   assert.equal(cleaned.KEEP, "1");
   assert.equal(cleaned.PATH, "/usr/bin");
 
-  const withTok = withClaudeOAuthToken("oauth-access", { PATH: "/bin" });
-  assert.equal(withTok.CLAUDE_CODE_OAUTH_TOKEN, "oauth-access");
-  assert.equal(withTok.ANTHROPIC_API_KEY, undefined);
+  // The UI login delegates the complete OAuth flow to the official CLI.
+  {
+    const {
+      getClaudeCliLoginStatus,
+      resetClaudeCliLoginForTests,
+      startClaudeCliLogin,
+    } = await import("../src/cli-login.ts");
+    const fake = Object.assign(new EventEmitter(), {
+      pid: 1234,
+      exitCode: null as number | null,
+      killed: false,
+      kill() {
+        this.killed = true;
+        return true;
+      },
+    });
+    let invocation: {
+      executable: string;
+      args: string[];
+      options: Record<string, unknown>;
+    } | null = null;
+    const started = startClaudeCliLogin({
+      binaryPath: "/usr/local/bin/claude",
+      env: {
+        PATH: "/usr/local/bin",
+        CLAUDE_CODE_OAUTH_TOKEN: "must-not-leak",
+      },
+      spawnLogin(executable, args, options) {
+        invocation = {
+          executable,
+          args,
+          options: options as Record<string, unknown>,
+        };
+        return fake as any;
+      },
+    });
+    assert.deepEqual(started, { state: "running", pid: 1234 });
+    assert.equal(invocation!.executable, "/usr/local/bin/claude");
+    assert.deepEqual(invocation!.args, ["auth", "login", "--claudeai"]);
+    assert.equal(
+      (invocation!.options.env as Record<string, unknown>)
+        .CLAUDE_CODE_OAUTH_TOKEN,
+      undefined,
+    );
+    fake.exitCode = 0;
+    fake.emit("exit", 0, null);
+    assert.deepEqual(getClaudeCliLoginStatus(), { state: "succeeded" });
+    resetClaudeCliLoginForTests();
+  }
 
   // Auth status interpretation (subscription vs API-key-only)
   assert.equal(
@@ -122,8 +124,6 @@ async function main() {
   assert.ok(models.some((m) => m.id === "opus"));
   assert.equal(resolveClaudeModelId("haiku"), "claude-haiku-4-5");
   assert.equal(resolveClaudeModelId("sonnet"), "sonnet");
-  assert.equal(isLoginPlaceholderModel("login"), true);
-  assert.equal(isLoginPlaceholderModel("sonnet"), false);
 
   const sonnet = CLAUDE_CODE_MODELS.find((m) => m.id === "sonnet")!;
   const variants = buildEffortVariants(sonnet);
@@ -470,19 +470,13 @@ async function main() {
     /1000 → 100/,
   );
 
-  // Session auto-naming: detect title/summary meta requests + sanitize titles
+  // Session auto-naming: detect title/summary meta requests.
   {
     const {
       detectMetaRequestKind,
       isTitleGenerationRequest,
       requestKeyNamespace,
-      buildMetaPrompt,
     } = await import("../src/request-kind.ts");
-    const {
-      sanitizeMetaOutput,
-      heuristicTitle,
-      metaChatCompletionResponse,
-    } = await import("../src/meta-completion.ts");
 
     const titleMessages = [
       {
@@ -496,23 +490,6 @@ async function main() {
     assert.equal(detectMetaRequestKind(titleMessages), "title");
     assert.equal(requestKeyNamespace("title"), "title:");
     assert.equal(requestKeyNamespace(null), "");
-
-    const meta = buildMetaPrompt(titleMessages);
-    assert.match(meta.system, /title generator/i);
-    assert.match(meta.prompt, /binary trees/i);
-
-    assert.equal(
-      sanitizeMetaOutput('"Binary Trees Basics"', "title"),
-      "Binary Trees Basics",
-    );
-    assert.equal(
-      sanitizeMetaOutput("Title: Foo Bar", "title"),
-      "Foo Bar",
-    );
-    assert.equal(
-      sanitizeMetaOutput("", "title", "user: Explain hashing"),
-      heuristicTitle("user: Explain hashing"),
-    );
 
     const summaryMessages = [
       {
@@ -590,16 +567,9 @@ async function main() {
   );
   assert.equal(requestHeaders["x-opencode-claude-session"], "ses_test");
   assert.equal(PROVIDER_ID, "claude-code");
-  assert.ok(RefreshTokenInvalidError);
-
   // Proxy health (without Agent SDK turn)
   await stopProxy();
-  const port = await startProxy(async () => null);
-  // Deterministic pre-flight: pretend CLI credentials exist (the smoke host
-  // may or may not have real ones). The dedicated pre-flight test below
-  // overrides this with `false`.
-  const { setClaudeCredentialProbe } = await import("../src/proxy.ts");
-  setClaudeCredentialProbe(() => true);
+  const port = await startProxy();
   assert.ok(port > 0);
   assert.equal(getProxyPort(), port);
   assert.ok(getClaudeProxyBaseUrl().includes(String(port)));
@@ -618,39 +588,76 @@ async function main() {
   assert.ok(Array.isArray(modelsJson.data));
   assert.ok(modelsJson.data.length > 0);
 
-  // Title meta path without OAuth → heuristic title via OpenAI SSE (fast)
+  // Title meta requests use a constrained, tool-free Agent SDK turn.
   {
-    const titleStarted = Date.now();
-    const titleRes = await fetch(
-      `http://127.0.0.1:${port}/v1/chat/completions`,
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          model: "claude-haiku-4-5",
-          stream: true,
-          messages: [
-            {
-              role: "system",
-              content:
-                "You are a title generator. Generate a brief title. Output only the title.",
+    const { setClaudeQueryStarter } = await import("../src/proxy.ts");
+    let titleOptions: Record<string, unknown> | null = null;
+    setClaudeQueryStarter(async (params) => {
+      titleOptions = params as unknown as Record<string, unknown>;
+      return {
+        stream: (async function* () {
+          yield {
+            type: "stream_event",
+            event: {
+              type: "content_block_delta",
+              delta: { type: "text_delta", text: "Binary search trees" },
             },
-            {
-              role: "user",
-              content: "Explain how binary search trees work",
-            },
-          ],
-        }),
-      },
-    );
-    assert.equal(titleRes.status, 200);
-    const titleBody = await titleRes.text();
-    const titleMs = Date.now() - titleStarted;
-    assert.ok(titleMs < 2000, `title path too slow: ${titleMs}ms`);
-    assert.match(titleBody, /data: /);
-    assert.match(titleBody, /\[DONE\]/);
-    assert.match(titleBody, /binary search trees/i);
-    assert.doesNotMatch(titleBody, /reasoning_content/);
+          };
+          yield { type: "result", is_error: false, usage: {} };
+        })(),
+        interrupt: async () => {},
+        close: () => {},
+        getPid: () => null,
+      };
+    });
+    try {
+      const titleRes = await fetch(
+        `http://127.0.0.1:${port}/v1/chat/completions`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            model: "claude-haiku-4-5",
+            stream: true,
+            messages: [
+              {
+                role: "system",
+                content:
+                  "You are a title generator. Generate a brief title. Output only the title.",
+              },
+              {
+                role: "user",
+                content: "Explain how binary search trees work",
+              },
+            ],
+          }),
+        },
+      );
+      assert.equal(titleRes.status, 200);
+      const titleBody = await titleRes.text();
+      assert.match(titleBody, /data: /);
+      assert.match(titleBody, /\[DONE\]/);
+      assert.match(titleBody, /Binary search trees/);
+      assert.ok(titleOptions, "title request reached Agent SDK");
+      assert.equal(
+        (titleOptions!.env as Record<string, unknown>).CLAUDE_CODE_OAUTH_TOKEN,
+        undefined,
+      );
+      assert.deepEqual(titleOptions!.tools, []);
+      assert.deepEqual(titleOptions!.settingSources, []);
+      assert.deepEqual(titleOptions!.skills, []);
+      assert.equal(titleOptions!.maxTurns, 1);
+      assert.equal(titleOptions!.autoCompactEnabled, false);
+      assert.deepEqual(titleOptions!.thinking, { type: "disabled" });
+      assert.equal(titleOptions!.resume, undefined);
+      assert.equal(
+        titleOptions!.systemPrompt,
+        "You generate short session titles. Follow the requested output format exactly.",
+      );
+      assert.match(String(titleOptions!.prompt), /<request>\nExplain how binary search trees work\n<\/request>/);
+    } finally {
+      setClaudeQueryStarter(null);
+    }
   }
 
   // ---- Rate-limit tracker + tool/plan behavior (mocked Agent SDK) ----
@@ -999,7 +1006,7 @@ async function main() {
       assert.match(blockedJson.error?.message ?? "", /limit resets in/);
       assert.ok((blockedJson.error?.retry_after ?? 0) > 0);
 
-      // Meta (title) path is NOT gated — sessions still get named while limited
+      // Meta requests use Agent SDK too, so a confirmed hard limit gates them.
       const metaRes = await fetch(
         `http://127.0.0.1:${port}/v1/chat/completions`,
         {
@@ -1019,7 +1026,7 @@ async function main() {
           }),
         },
       );
-      assert.equal(metaRes.status, 200);
+      assert.equal(metaRes.status, 429);
 
       // Counter endpoint reports the active limit with countdown
       const limitedRes = await fetch(`http://127.0.0.1:${port}/v1/rate-limit`);
@@ -1294,9 +1301,7 @@ async function main() {
 
   // ---- Fail-fast taxonomy: dead turns get truthful HTTP statuses ----
   {
-    const { setClaudeQueryStarter, setClaudeCredentialProbe } = await import(
-      "../src/proxy.ts"
-    );
+    const { setClaudeQueryStarter } = await import("../src/proxy.ts");
     const { classifyClaudeFailure } = await import("../src/failure.ts");
     const { mkdtempSync, rmSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
@@ -1364,7 +1369,7 @@ async function main() {
       };
       assert.equal(authStreamJson.error?.type, "authentication_error");
       assert.equal(authStreamJson.error?.code, "claude_auth");
-      assert.match(authStreamJson.error?.message ?? "", /Re-authenticate/);
+      assert.match(authStreamJson.error?.message ?? "", /claude auth login/);
 
       const authBuffered = await postTurn("ff-auth-buffered", false);
       assert.equal(authBuffered.status, 401);
@@ -1429,23 +1434,6 @@ async function main() {
       assert.equal(emptyRes.status, 200);
       assert.match(await emptyRes.text(), /\[DONE\]/);
 
-      // Pre-flight: no token provider result AND no CLI credentials → 401
-      // without ever starting a turn.
-      let starterCalled = false;
-      setClaudeQueryStarter(async () => {
-        starterCalled = true;
-        throw new Error("must not be called");
-      });
-      setClaudeCredentialProbe(() => false);
-      const noCredRes = await postTurn("ff-no-creds", true);
-      assert.equal(noCredRes.status, 401);
-      const noCredJson = (await noCredRes.json()) as {
-        error?: { code?: string };
-      };
-      assert.equal(noCredJson.error?.code, "claude_auth_required");
-      assert.equal(starterCalled, false, "no doomed turn was spawned");
-      setClaudeCredentialProbe(() => true);
-
       // First content after Bun's default 10s idleTimeout must not RST.
       // OpenCode surfaces that as retryable "Connection reset by server".
       setClaudeQueryStarter(async () => ({
@@ -1480,7 +1468,6 @@ async function main() {
       );
     } finally {
       setClaudeQueryStarter(null);
-      setClaudeCredentialProbe(null);
       if (prevStoreEnv === undefined) {
         delete process.env.OPENCODE_CLAUDE_RATE_LIMIT_STORE;
       } else {
@@ -1490,162 +1477,7 @@ async function main() {
     }
   }
 
-  // ---- CLI credential sync poisoning guards ----
-  {
-    const { syncClaudeCliCredentialsToOpenCode } = await import(
-      "../src/auth-login.ts"
-    );
-    const { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } =
-      await import("node:fs");
-    const { tmpdir } = await import("node:os");
-    const { join: joinPath } = await import("node:path");
-
-    const tmpDir = mkdtempSync(joinPath(tmpdir(), "oc-claude-sync-"));
-    const fakeHome = joinPath(tmpDir, "home");
-    mkdirSync(joinPath(fakeHome, ".claude"), { recursive: true });
-    const prevXdg = process.env.XDG_DATA_HOME;
-    process.env.XDG_DATA_HOME = joinPath(tmpDir, "data");
-    const authFile = joinPath(tmpDir, "data", "opencode", "auth.json");
-    const writeCliCreds = (accessToken: string, expiresAt: number) =>
-      writeFileSync(
-        joinPath(fakeHome, ".claude", ".credentials.json"),
-        JSON.stringify({
-          claudeAiOauth: {
-            accessToken,
-            refreshToken: "cli-refresh",
-            expiresAt,
-            scopes: ["user:inference"],
-          },
-        }),
-      );
-
-    try {
-      // 1. Expired CLI token must NOT be synced (would shadow healthy creds
-      //    and block the CLI's own auto-refresh via env override).
-      writeCliCreds("dead-access", Date.now() - 60_000);
-      const syncedDead = syncClaudeCliCredentialsToOpenCode({
-        homeDir: fakeHome,
-        env: {},
-      });
-      assert.equal(syncedDead, null, "expired CLI token is not synced");
-
-      // 2. Fresh-but-older CLI token must not clobber a newer auth entry.
-      writeCliCreds("cli-access", Date.now() + 3600_000);
-      mkdirSync(joinPath(tmpDir, "data", "opencode"), { recursive: true });
-      writeFileSync(
-        authFile,
-        JSON.stringify({
-          "claude-code": {
-            type: "oauth",
-            access: "oauth-access",
-            refresh: "oauth-refresh",
-            expires: Date.now() + 8 * 3600_000,
-          },
-        }),
-      );
-      const syncedOlder = syncClaudeCliCredentialsToOpenCode({
-        homeDir: fakeHome,
-        env: {},
-      });
-      assert.equal(syncedOlder, null, "older CLI creds do not clobber newer");
-      const kept = JSON.parse(readFileSync(authFile, "utf8")) as {
-        "claude-code": { access: string };
-      };
-      assert.equal(kept["claude-code"].access, "oauth-access");
-
-      // 3. Newer CLI token wins and is written through. The refresh token is
-      //    TAGGED as CLI-owned so the plugin never rotates it (rotation is
-      //    the CLI's job — dual ownership gets grants revoked).
-      writeCliCreds("cli-access-new", Date.now() + 9 * 3600_000);
-      const syncedNewer = syncClaudeCliCredentialsToOpenCode({
-        homeDir: fakeHome,
-        env: {},
-      });
-      assert.equal(syncedNewer?.access, "cli-access-new");
-      const rewritten = JSON.parse(readFileSync(authFile, "utf8")) as {
-        "claude-code": { access: string; refresh: string };
-      };
-      assert.equal(rewritten["claude-code"].access, "cli-access-new");
-      assert.equal(rewritten["claude-code"].refresh, "cli-shared-cli-refresh");
-
-      const { isCliOwnedRefreshToken, readStoredClaudeOAuth } = await import(
-        "../src/auth-login.ts"
-      );
-      assert.equal(isCliOwnedRefreshToken("cli-shared-cli-refresh"), true);
-      assert.equal(isCliOwnedRefreshToken("cli-sync-credentials-file"), true);
-      assert.equal(isCliOwnedRefreshToken("sk-ant-ort01-real"), false);
-
-      // On-disk OAuth entry is readable regardless of the host's auth store
-      const stored = readStoredClaudeOAuth();
-      assert.equal(stored?.access, "cli-access-new");
-      assert.equal(stored?.refresh, "cli-shared-cli-refresh");
-    } finally {
-      if (prevXdg === undefined) {
-        delete process.env.XDG_DATA_HOME;
-      } else {
-        process.env.XDG_DATA_HOME = prevXdg;
-      }
-      rmSync(tmpDir, { recursive: true, force: true });
-    }
-  }
-
-  // ---- Meta fast path is wire-identical to Claude Code CLI ----
-  {
-    const { completeMetaRequest } = await import("../src/meta-completion.ts");
-    const realFetch = globalThis.fetch;
-    let captured: { url: unknown; init?: RequestInit } | null = null;
-    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
-      captured = { url, init };
-      return new Response(
-        JSON.stringify({
-          model: "claude-haiku-4-5",
-          content: [{ type: "text", text: "Mock Title" }],
-          usage: { input_tokens: 3, output_tokens: 2 },
-        }),
-        { status: 200, headers: { "content-type": "application/json" } },
-      );
-    }) as typeof fetch;
-
-    try {
-      const result = await completeMetaRequest({
-        body: {
-          messages: [
-            { role: "system", content: "You are a title generator." },
-            { role: "user", content: "hello there" },
-          ],
-        },
-        kind: "title",
-        accessToken: "oauth-token-xyz",
-      });
-      assert.equal(result.text, "Mock Title");
-      assert.ok(captured, "meta request captured");
-      const headers = captured!.init?.headers as Record<string, string>;
-      assert.equal(headers.authorization, "Bearer oauth-token-xyz");
-      assert.equal(headers["anthropic-version"], "2023-06-01");
-      assert.equal(headers["anthropic-beta"], "oauth-2025-04-20");
-      assert.equal(headers["x-app"], "cli");
-      assert.equal(
-        headers["anthropic-dangerous-direct-browser-access"],
-        "true",
-      );
-      assert.match(headers["user-agent"] ?? "", /^claude-cli\/\d+\.\d+\.\d+ /);
-      const body = JSON.parse(String(captured!.init?.body)) as {
-        system?: Array<{ type: string; text: string }>;
-      };
-      assert.ok(Array.isArray(body.system), "system sent as block array");
-      assert.equal(
-        body.system![0]!.text,
-        "You are Claude Code, Anthropic's official CLI.",
-        "CLI preamble is the first system block",
-      );
-      assert.match(body.system![1]?.text ?? "", /title generator/);
-    } finally {
-      globalThis.fetch = realFetch;
-    }
-  }
-
   await stopProxy();
-  setClaudeCredentialProbe(null);
 
   // TypeScript build
   const build = spawnSync("bun", ["run", "build"], {
