@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.12.0 - 2026-08-15
 
 - **Claude CLI-owned authentication**: removed the plugin's browser OAuth,
   credential-file parsing, token copying, token refresh, and OAuth environment
@@ -11,6 +11,12 @@
 - **Agent SDK-only inference**: title and summary generation now follows the
   same Agent SDK / Claude Code path as normal chats. The plugin no longer sends
   direct requests to Anthropic inference or OAuth endpoints.
+- **Reliable utility turns**: title and summary requests run as constrained,
+  tool-free Agent SDK turns, preventing repository inspection and agent-style
+  responses from leaking into generated session titles.
+- **Stable model catalog**: Claude models are available independently of the
+  CLI login snapshot, so signing in no longer requires an OpenCode restart to
+  replace placeholder models.
 
 ## 0.11.1
 

@@ -19,6 +19,7 @@
     "opencode-claude.js"
   ],
   "scripts": {
+    "prebuild": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
     "build": "tsc -p tsconfig.json",
     "test": "bun test/smoke.ts",
     "test:haiku": "bun test/haiku-live.ts",
