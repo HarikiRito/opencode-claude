@@ -89,7 +89,7 @@ export const SSE_HEARTBEAT_MS = 5_000;
 /**
  * Optional pinned port via OPENCODE_CLAUDE_PROXY_PORT.
  * Default is `0` — Bun binds an ephemeral free port; the live URL is then
- * published through the config hook + auth loader so OpenCode always hits the
+ * published through the config hook so OpenCode always hits the
  * process that owns the listener (no static 8787 requirement).
  */
 const REQUESTED_PROXY_PORT: number = (() => {

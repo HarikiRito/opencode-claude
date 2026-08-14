@@ -12,6 +12,12 @@
 
 Use Claude from [OpenCode](https://opencode.ai) and [OpenChamber](https://github.com/openchamber/openchamber) without an Anthropic API key. The plugin runs the official Anthropic Agent SDK plus the local `claude` CLI and proxies an OpenAI-compatible `/v1/chat/completions` surface into OpenCode. Claude Code owns authentication; the plugin never reads, copies, refreshes, or sends your credentials itself.
 
+### Official Claude runtime
+
+**Built on Anthropic's official Agent SDK and Claude Code authentication flow. Designed for local, user-operated Claude Code usage.**
+
+No OAuth tokens are extracted, copied, stored, injected, or sent by this plugin. All authentication and model access are performed internally by the official Claude Code runtime. The plugin does not call Anthropic inference endpoints directly and does not impersonate Anthropic API clients.
+
 Sibling plugins: [@openchamber/opencode-cursor](https://github.com/openchamber/opencode-cursor) and [@openchamber/opencode-commandcode](https://github.com/openchamber/opencode-commandcode).
 
 ![opencode-claude — Claude Code in OpenCode, local CLI auth, Agent SDK](docs/header.svg)
@@ -113,7 +119,7 @@ The plugin does not implement OAuth, inspect Claude credential files, inject tok
 ```text
 OpenCode
   └─ /v1/chat/completions
-       └─ Bun.serve proxy (ephemeral port; published via auth loader)
+       └─ Bun.serve proxy (ephemeral port; configured by the plugin)
             └─ Claude Agent SDK query()
                  └─ claude CLI (subscription OAuth)
 ```
@@ -154,7 +160,7 @@ Debug logging: `OPENCODE_CLAUDE_DEBUG=1`.
 
 Optional knobs:
 
-- `OPENCODE_CLAUDE_PROXY_PORT` — optional pinned proxy port (default: ephemeral / OS-assigned; live URL is published to OpenCode via config + auth loader)
+- `OPENCODE_CLAUDE_PROXY_PORT` — optional pinned proxy port (default: ephemeral / OS-assigned; live URL is published to OpenCode via plugin config)
 - `OPENCODE_CLAUDE_CWD` — working directory passed to the Agent SDK
 - `OPENCODE_CLAUDE_RATE_LIMIT_FAST_FAIL` — `0` disables the 429 rate-limit gate
 - `OPENCODE_CLAUDE_RATE_LIMIT_STORE` — override the rate-limit store path (tests)
