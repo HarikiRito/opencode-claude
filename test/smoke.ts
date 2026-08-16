@@ -52,55 +52,164 @@ async function main() {
   assert.equal(cleaned.KEEP, "1");
   assert.equal(cleaned.PATH, "/usr/bin");
 
-  // The UI login delegates the complete OAuth flow to the official CLI.
+  // The UI login relays the official CLI flow: its authorize URL comes back to
+  // the host, and the code the user pastes goes into the CLI's stdin.
   {
     const {
       getClaudeCliLoginStatus,
       resetClaudeCliLoginForTests,
       startClaudeCliLogin,
+      submitClaudeCliLoginCode,
     } = await import("../src/cli-login.ts");
-    const fake = Object.assign(new EventEmitter(), {
-      pid: 1234,
-      exitCode: null as number | null,
-      killed: false,
-      kill() {
-        this.killed = true;
-        return true;
-      },
-    });
-    let invocation: {
-      executable: string;
-      args: string[];
-      options: Record<string, unknown>;
-    } | null = null;
-    const started = startClaudeCliLogin({
-      binaryPath: "/usr/local/bin/claude",
-      env: {
-        PATH: "/usr/local/bin",
-        CLAUDE_CODE_OAUTH_TOKEN: "must-not-leak",
-      },
-      spawnLogin(executable, args, options) {
-        invocation = {
-          executable,
-          args,
-          options: options as Record<string, unknown>,
-        };
-        return fake as any;
-      },
-    });
-    assert.deepEqual(started, { state: "running", pid: 1234 });
-    assert.equal(invocation!.executable, "/usr/local/bin/claude");
-    assert.deepEqual(invocation!.args, ["auth", "login", "--claudeai"]);
-    assert.equal(
-      (invocation!.options.env as Record<string, unknown>)
-        .CLAUDE_CODE_OAUTH_TOKEN,
-      undefined,
-    );
-    fake.exitCode = 0;
-    fake.emit("exit", 0, null);
-    assert.deepEqual(getClaudeCliLoginStatus(), { state: "succeeded" });
-    resetClaudeCliLoginForTests();
+
+    const createFakeCli = () => {
+      const makeStream = () =>
+        Object.assign(new EventEmitter(), { setEncoding() {} });
+      const writes: string[] = [];
+      const child = Object.assign(new EventEmitter(), {
+        pid: 1234,
+        exitCode: null as number | null,
+        killed: false,
+        stdout: makeStream(),
+        stderr: makeStream(),
+        stdin: Object.assign(new EventEmitter(), {
+          writable: true,
+          write(chunk: string) {
+            writes.push(chunk);
+            return true;
+          },
+        }),
+        kill() {
+          this.killed = true;
+          return true;
+        },
+      });
+      return { child, writes };
+    };
+    const authorizeUrl =
+      "https://claude.com/cai/oauth/authorize?code=true&client_id=abc&state=xyz";
+    const cliBanner = (url: string) =>
+      `Opening browser to sign in…\nIf the browser didn't open, visit: ${url}\nPaste code here if prompted > `;
+    const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+    // Accepted code: URL relayed out, code relayed in, exit 0 is the success.
+    {
+      const { child, writes } = createFakeCli();
+      let invocation: {
+        executable: string;
+        args: string[];
+        options: Record<string, unknown>;
+      } | null = null;
+      const pending = startClaudeCliLogin({
+        binaryPath: "/usr/local/bin/claude",
+        env: {
+          PATH: "/usr/local/bin",
+          CLAUDE_CODE_OAUTH_TOKEN: "must-not-leak",
+        },
+        spawnLogin(executable, args, options) {
+          invocation = {
+            executable,
+            args,
+            options: options as Record<string, unknown>,
+          };
+          return child as any;
+        },
+      });
+      await tick();
+      child.stdout.emit("data", cliBanner(authorizeUrl));
+      const started = await pending;
+
+      assert.deepEqual(started, { state: "awaiting-code", url: authorizeUrl });
+      assert.equal(invocation!.executable, "/usr/local/bin/claude");
+      assert.deepEqual(invocation!.args, ["auth", "login", "--claudeai"]);
+      assert.deepEqual(invocation!.options.stdio, ["pipe", "pipe", "pipe"]);
+      assert.equal(
+        (invocation!.options.env as Record<string, unknown>)
+          .CLAUDE_CODE_OAUTH_TOKEN,
+        undefined,
+      );
+
+      const submitted = submitClaudeCliLoginCode("  pasted-code  ");
+      assert.deepEqual(writes, ["pasted-code\n"]);
+      await tick();
+      child.exitCode = 0;
+      child.emit("exit", 0, null);
+      assert.deepEqual(await submitted, { ok: true });
+      assert.deepEqual(getClaudeCliLoginStatus(), { state: "succeeded" });
+      resetClaudeCliLoginForTests();
+    }
+
+    // Rejected code: the CLI keeps prompting on the same challenge, so failure
+    // is reported from its stderr rather than from an exit that never comes.
+    {
+      const { child, writes } = createFakeCli();
+      const pending = startClaudeCliLogin({
+        binaryPath: "/usr/local/bin/claude",
+        env: { PATH: "/usr/local/bin" },
+        spawnLogin: () => child as any,
+      });
+      await tick();
+      child.stdout.emit("data", cliBanner(authorizeUrl));
+      await pending;
+
+      const submitted = submitClaudeCliLoginCode("wrong-code");
+      await tick();
+      child.stderr.emit(
+        "data",
+        "Invalid code. Please make sure the full code was copied.\n",
+      );
+      const result = await submitted;
+      assert.equal(result.ok, false);
+      assert.match(
+        result.ok ? "" : result.message,
+        /Invalid code\. Please make sure the full code was copied\./,
+      );
+
+      // Retrying reuses the live sign-in and its still-valid URL — respawning
+      // would abandon the verifier the CLI holds in memory.
+      const resumed = await startClaudeCliLogin({
+        binaryPath: "/usr/local/bin/claude",
+        env: { PATH: "/usr/local/bin" },
+        spawnLogin: () => {
+          throw new Error("a live sign-in must be reused, not respawned");
+        },
+      });
+      assert.deepEqual(resumed, { state: "awaiting-code", url: authorizeUrl });
+
+      // The stale rejection must not fail the next code before the CLI reads it.
+      const retried = submitClaudeCliLoginCode("second-code");
+      assert.deepEqual(writes, ["wrong-code\n", "second-code\n"]);
+      await tick();
+      child.exitCode = 0;
+      child.emit("exit", 0, null);
+      assert.deepEqual(await retried, { ok: true });
+      resetClaudeCliLoginForTests();
+    }
+
+    // No CLI on PATH: the host falls back to terminal instructions.
+    {
+      const missing = await startClaudeCliLogin({
+        binaryPath: null,
+        env: { PATH: "/usr/local/bin" },
+        spawnLogin: () => {
+          throw new Error("must not spawn without a binary");
+        },
+      });
+      assert.equal(missing.state, "failed");
+      assert.match(
+        missing.state === "failed" ? missing.message : "",
+        /not found on PATH/,
+      );
+      resetClaudeCliLoginForTests();
+    }
+
+    // A code submitted with no sign-in running is refused, not written blind.
+    {
+      const orphan = await submitClaudeCliLoginCode("code-without-session");
+      assert.equal(orphan.ok, false);
+    }
   }
+
 
   // Auth status interpretation (subscription vs API-key-only)
   assert.equal(

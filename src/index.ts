@@ -19,8 +19,8 @@ import {
 } from "./constants.js";
 import { detectClaudeCode } from "./detect.js";
 import {
-  getClaudeCliLoginStatus,
   startClaudeCliLogin,
+  submitClaudeCliLoginCode,
 } from "./cli-login.js";
 import { log } from "./log.js";
 import {
@@ -300,42 +300,72 @@ export const ClaudeCodePlugin: Plugin = async (
         {
           type: "oauth",
           label: "Sign in with Claude Code CLI",
+          /**
+           * The official CLI runs the whole flow; the host only relays it.
+           * `claude auth login --claudeai` prints an authorize URL and then
+           * waits on stdin for the code the Claude page shows, so the host UI
+           * can open that URL and pass the pasted code straight through —
+           * no separate terminal, and no OAuth implemented here.
+           *
+           * The only URL this method ever hands out is the CLI's own sign-in
+           * page: any other link would open a tab that cannot finish the
+           * sign-in, competing with the page the user actually has to use.
+           */
           async authorize() {
             const detection = await detectClaudeCode();
-            const launch = detection.loggedIn
-              ? { state: "succeeded" as const }
-              : startClaudeCliLogin({ cwd: input.directory });
-            if (launch.state === "failed") {
-              log.warn("[opencode-claude] Claude CLI login launch failed", {
-                message: launch.message,
-              });
+            if (detection.loggedIn) {
+              return {
+                url: "",
+                instructions: "Claude Code CLI is already signed in. Click Complete.",
+                method: "auto" as const,
+                async callback() {
+                  // OpenCode's callback runtime stores credentials only when
+                  // success includes key or refresh. Claude CLI needs neither.
+                  return { type: "success" as const } as any;
+                },
+              };
             }
+
+            const launch = await startClaudeCliLogin({ cwd: input.directory });
+            if (launch.state === "awaiting-code") {
+              return {
+                url: launch.url,
+                instructions:
+                  "Sign in on the Claude page that opened and paste the code it shows here. If the page did not open, use the sign-in link above — or run `claude auth login --claudeai` in a terminal instead and start this sign-in again.",
+                method: "code" as const,
+                async callback(code: string) {
+                  const submitted = await submitClaudeCliLoginCode(code);
+                  if (submitted.ok) return { type: "success" as const } as any;
+                  log.warn("[opencode-claude] Claude CLI login code rejected", {
+                    message: submitted.message,
+                  });
+                  // The CLI can store its grant and still exit oddly; trust
+                  // its own auth status over the exit code before failing.
+                  const verified = await detectClaudeCode();
+                  if (verified.loggedIn) {
+                    return { type: "success" as const } as any;
+                  }
+                  return { type: "failed" as const };
+                },
+              };
+            }
+
+            log.warn("[opencode-claude] Claude CLI login launch failed", {
+              message: launch.message,
+            });
+            // A missing CLI, or one whose prompt we could not read, lands here:
+            // fall back to the terminal and watch `claude auth status`. There
+            // is no page to open, so no URL is offered.
             return {
-              url: "https://code.claude.com/docs/en/authentication",
-              instructions:
-                launch.state === "running"
-                  ? "Claude Code opened its official sign-in flow in your browser. Finish signing in, then click Complete. If no browser opened, run `claude auth login --claudeai` in a terminal."
-                  : launch.state === "succeeded"
-                    ? "Claude Code CLI is already signed in. Click Complete."
-                    : `${
-                        launch.state === "failed" ? `${launch.message} ` : ""
-                      }Run \`claude auth login --claudeai\` in a terminal, then click Complete.`,
+              url: "",
+              instructions: `${launch.message} Run \`claude auth login --claudeai\` in a terminal, then click Complete.`,
               method: "auto" as const,
               async callback() {
                 const deadline = Date.now() + 5 * 60_000;
                 while (Date.now() < deadline) {
                   const detection = await detectClaudeCode();
                   if (detection.loggedIn) {
-                    // OpenCode's callback runtime stores credentials only when
-                    // success includes key or refresh. Claude CLI needs neither.
                     return { type: "success" as const } as any;
-                  }
-                  const login = getClaudeCliLoginStatus();
-                  if (login.state === "failed") {
-                    log.warn("[opencode-claude] Claude CLI login failed", {
-                      message: login.message,
-                    });
-                    return { type: "failed" as const };
                   }
                   await new Promise((resolve) => setTimeout(resolve, 1_000));
                 }

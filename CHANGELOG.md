@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- **Sign in without leaving the host**: the provider sign-in action now relays
+  the official CLI flow instead of only launching it. `claude auth login
+  --claudeai` runs with piped stdio, its authorize URL is handed to
+  OpenCode/OpenChamber to open, and the code Claude shows is pasted in the host
+  and written to the CLI's stdin. Success is still the CLI's own exit status,
+  and no OAuth, token, or credential handling moves into the plugin.
+- **No documentation link in the sign-in flow**: the only URL the provider
+  hands out is the CLI's own sign-in page. The Claude authentication docs link
+  that previously opened alongside — or instead of — the real page is gone, so
+  sign-in is either the link plus its code, or `claude auth login --claudeai`
+  in a terminal. The terminal fallback is still offered on its own when the CLI
+  is missing or its prompt cannot be read.
+
 ## 0.12.0 - 2026-08-15
 
 - **Claude CLI-owned authentication**: removed the plugin's browser OAuth,

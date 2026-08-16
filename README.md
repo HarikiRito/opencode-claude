@@ -26,7 +26,7 @@ Sibling plugins: [@openchamber/opencode-cursor](https://github.com/openchamber/o
 
 ### Use your local Claude Code login
 
-The OpenCode/OpenChamber sign-in action launches `claude auth login --claudeai`. The official CLI opens the browser, completes OAuth, and stores its own credentials. The plugin stores no credentials or connection markers in OpenCode; every inference request, including title and summary generation, runs through the Agent SDK.
+The OpenCode/OpenChamber sign-in action launches `claude auth login --claudeai` and relays it: the CLI's own sign-in page opens from the host, and the code Claude shows is pasted back into the host, not a separate terminal. The official CLI performs the OAuth exchange and stores its own credentials. The plugin stores no credentials or connection markers in OpenCode; every inference request, including title and summary generation, runs through the Agent SDK.
 
 ### Pick models and thinking effort
 
@@ -107,10 +107,13 @@ opencode plugin file://$PWD
 
 | Step | What happens |
 | --- | --- |
-| **Sign in with Claude Code CLI** in OpenCode/OpenChamber | Launches the official CLI login; the CLI opens the browser and owns OAuth |
-| `claude auth login --claudeai` | Terminal fallback for headless, SSH, or browser-launch failures |
+| **Sign in with Claude Code CLI** in OpenCode/OpenChamber | Launches the official CLI login and opens the sign-in page the CLI asked for |
+| Paste the code from the Claude page | Goes straight to the CLI's stdin; the CLI does the token exchange and owns the result |
+| `claude auth login --claudeai` | Terminal alternative, and the offered fallback when the CLI is missing or its prompt cannot be read |
 | Successful verification | Completes without writing to OpenCode's auth store |
 | Access expires | Claude Code refreshes its own credentials |
+
+Signing in is either the link and its code or the terminal command — the sign-in page the CLI asks for is the only URL the plugin ever hands to the host.
 
 The plugin does not implement OAuth, inspect Claude credential files, inject tokens, or call Anthropic inference endpoints directly.
 
