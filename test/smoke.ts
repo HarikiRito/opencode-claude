@@ -30,6 +30,7 @@ async function main() {
   const {
     applyClaudeRequestContextHeaders,
     buildAuthMethods,
+    manualInstallResponse,
     ClaudeCodePlugin,
   } = await import("../src/index.ts");
   const {
@@ -762,7 +763,10 @@ async function main() {
   assert.equal(typeof ClaudeCodePlugin, "function");
 
   // Auth methods mirror CLI presence: install only when missing, relay only
-  // when present, and every path carries the terminal alternative.
+  // when present, and every path carries the terminal alternative. The method
+  // bodies are not invoked here — on a CI host without the CLI the install
+  // method would run a real `npm install -g` — so the terminal fallback is
+  // exercised through its pure builder instead.
   {
     const withoutCli = buildAuthMethods(false, "/tmp");
     assert.equal(withoutCli.length, 1);
@@ -775,19 +779,12 @@ async function main() {
     assert.equal(withCli.length, 1);
     assert.equal(withCli[0]!.label, "Sign in with Claude Code CLI");
 
-    // authorize on a host without the CLI re-detects at run time: on the test
-    // host the CLI is present, so it lands on either the relay (`code`) or the
-    // already-signed-in path (`auto`) — both must name the terminal
-    // alternative.
-    const installAuthorize = withoutCli[0]!.authorize as () => Promise<
-      Record<string, unknown>
-    >;
-    const installed = await installAuthorize();
-    assert.ok(["code", "auto"].includes(String(installed.method)));
-    assert.match(
-      String(installed.instructions),
-      /claude auth login --claudeai/,
-    );
+    // The fallback instructions always name both the install and the auth
+    // command, whatever the launch failure message was.
+    const fallback = manualInstallResponse("boom");
+    assert.match(fallback.instructions, /npm install -g @anthropic-ai\/claude-code/);
+    assert.match(fallback.instructions, /claude auth login --claudeai/);
+    assert.equal(fallback.method, "auto");
   }
 
   const requestHeaders: Record<string, string> = {};

@@ -451,7 +451,7 @@ function relayOrFallback(
  * install action), and the callback watches `claude auth status` until the
  * grant lands. The message always names both the install and the auth command.
  */
-function manualInstallResponse(launchMessage: string) {
+export function manualInstallResponse(launchMessage: string) {
   return {
     url: "",
     instructions: `${launchMessage}
