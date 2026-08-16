@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.13.0 - 2026-08-16
 
 - **Sign in without leaving the host**: the provider sign-in action now relays
   the official CLI flow instead of only launching it. `claude auth login
