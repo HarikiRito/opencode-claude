@@ -107,9 +107,10 @@ opencode plugin file://$PWD
 
 | Step | What happens |
 | --- | --- |
-| **Sign in with Claude Code CLI** in OpenCode/OpenChamber | Launches the official CLI login and opens the sign-in page the CLI asked for |
+| **Sign in with Claude Code CLI** | Shown when the CLI is installed: launches the official CLI login and opens the sign-in page the CLI asked for |
+| **Install Claude Code CLI and sign in** | Shown only when the CLI is missing: runs the official installer (`npm i -g @anthropic-ai/claude-code`, official install script as fallback), then continues with the sign-in relay |
 | Paste the code from the Claude page | Goes straight to the CLI's stdin; the CLI does the token exchange and owns the result |
-| `claude auth login --claudeai` | Terminal alternative, and the offered fallback when the CLI is missing or its prompt cannot be read |
+| `claude auth login --claudeai` | Terminal alternative, always called out in the instructions — also the offered fallback when the CLI is missing (with the install command alongside) |
 | Successful verification | Completes without writing to OpenCode's auth store |
 | Access expires | Claude Code refreshes its own credentials |
 
@@ -147,7 +148,7 @@ The proxy records Agent SDK `rate_limit_event` telemetry and hard session-limit 
 ## Requirements
 
 - [OpenCode](https://opencode.ai)
-- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) on `PATH`
+- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) — on `PATH` or installed via the provider's install action (npm is used, or the official install script); the plugin also checks `~/.local/bin` and the npm global bin for a CLI the server PATH cannot see
 - Claude plan supported by Claude Code
 - Bun (plugin runtime) · Node.js ≥ 18
 

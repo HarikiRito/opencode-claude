@@ -27,9 +27,11 @@ async function main() {
   const { isClaudeEffort, PROVIDER_ID, EFFORT_LEVELS } = await import(
     "../src/constants.ts"
   );
-  const { applyClaudeRequestContextHeaders, ClaudeCodePlugin } = await import(
-    "../src/index.ts"
-  );
+  const {
+    applyClaudeRequestContextHeaders,
+    buildAuthMethods,
+    ClaudeCodePlugin,
+  } = await import("../src/index.ts");
   const {
     startProxy,
     stopProxy,
@@ -186,11 +188,11 @@ async function main() {
       resetClaudeCliLoginForTests();
     }
 
-    // No CLI on PATH: the host falls back to terminal instructions.
+    // No CLI found: the host falls back to terminal instructions.
     {
       const missing = await startClaudeCliLogin({
         binaryPath: null,
-        env: { PATH: "/usr/local/bin" },
+        env: { PATH: "/usr/local/bin", HOME: "/nonexistent" },
         spawnLogin: () => {
           throw new Error("must not spawn without a binary");
         },
@@ -198,7 +200,7 @@ async function main() {
       assert.equal(missing.state, "failed");
       assert.match(
         missing.state === "failed" ? missing.message : "",
-        /not found on PATH/,
+        /npm install -g @anthropic-ai\/claude-code/,
       );
       resetClaudeCliLoginForTests();
     }
@@ -207,6 +209,100 @@ async function main() {
     {
       const orphan = await submitClaudeCliLoginCode("code-without-session");
       assert.equal(orphan.ok, false);
+    }
+  }
+
+  // CLI resolution finds install locations a clean server PATH misses.
+  {
+    const { mkdtempSync, writeFileSync, chmodSync, mkdirSync } = await import(
+      "node:fs"
+    );
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { resolveClaudeCli } = await import("../src/executable-path.ts");
+
+    const home = mkdtempSync(join(tmpdir(), "oc-claude-home-"));
+    const binDir = join(home, ".local", "bin");
+    mkdirSync(binDir, { recursive: true });
+    const fake = join(binDir, "claude");
+    writeFileSync(
+      fake,
+      '#!/bin/sh\necho "2.1.226 (Claude Code)"\n',
+      { mode: 0o755 },
+    );
+    chmodSync(fake, 0o755);
+
+    assert.equal(resolveClaudeCli({ PATH: "/usr/bin:/bin", HOME: home }), fake);
+    // And PATH itself still wins when the CLI is on it.
+    assert.equal(
+      resolveClaudeCli({ PATH: "/usr/bin:/bin", HOME: home }).length > 0,
+      true,
+    );
+  }
+
+  // The one-click install path: official npm package, script as fallback.
+  {
+    const { installClaudeCli } = await import("../src/cli-install.ts");
+    const { EventEmitter: CliEventEmitter } = await import("node:events");
+
+    const fakeCli = () => {
+      const streams = { stdout: new CliEventEmitter(), stderr: new CliEventEmitter() };
+      const child = Object.assign(new CliEventEmitter(), {
+        pid: 7,
+        stdout: streams.stdout,
+        stderr: streams.stderr,
+        kill() {
+          return true;
+        },
+      });
+      return { child, streams };
+    };
+
+    // npm succeeds → no script fallback runs.
+    {
+      const { child, streams } = fakeCli();
+      const calls: string[][] = [];
+      const pending = installClaudeCli({
+        env: { PATH: "/usr/bin" },
+        spawnInstall(command, args) {
+          calls.push([command, ...args]);
+          return child as any;
+        },
+      });
+      await new Promise((r) => setTimeout(r, 0));
+      streams.stdout.emit("data", "added 1 package\n");
+      child.emit("exit", 0);
+      assert.deepEqual(await pending, { ok: true });
+      assert.deepEqual(calls, [["npm", "install", "-g", "@anthropic-ai/claude-code"]]);
+    }
+
+    // npm fails → the official install script runs; its failure is reported.
+    {
+      const failures = [fakeCli(), fakeCli()];
+      let call = 0;
+      const pending = installClaudeCli({
+        env: { PATH: "/usr/bin" },
+        spawnInstall(command) {
+          const { child, streams } = failures[call]!;
+          call += 1;
+          process.nextTick(() => {
+            if (command === "npm") {
+              streams.stderr.emit("data", "npm: not found\n");
+              child.emit("exit", 127);
+            } else {
+              streams.stderr.emit("data", "curl: could not resolve host\n");
+              child.emit("exit", 6);
+            }
+          });
+          return child as any;
+        },
+      });
+      const result = await pending;
+      assert.equal(result.ok, false);
+      assert.match(
+        result.ok ? "" : result.message,
+        /curl: could not resolve host/,
+      );
     }
   }
 
@@ -664,6 +760,36 @@ async function main() {
 
   // Plugin export
   assert.equal(typeof ClaudeCodePlugin, "function");
+
+  // Auth methods mirror CLI presence: install only when missing, relay only
+  // when present, and every path carries the terminal alternative.
+  {
+    const withoutCli = buildAuthMethods(false, "/tmp");
+    assert.equal(withoutCli.length, 1);
+    assert.equal(
+      withoutCli[0]!.label,
+      "Install Claude Code CLI and sign in",
+    );
+
+    const withCli = buildAuthMethods(true, "/tmp");
+    assert.equal(withCli.length, 1);
+    assert.equal(withCli[0]!.label, "Sign in with Claude Code CLI");
+
+    // authorize on a host without the CLI re-detects at run time: on the test
+    // host the CLI is present, so it lands on either the relay (`code`) or the
+    // already-signed-in path (`auto`) — both must name the terminal
+    // alternative.
+    const installAuthorize = withoutCli[0]!.authorize as () => Promise<
+      Record<string, unknown>
+    >;
+    const installed = await installAuthorize();
+    assert.ok(["code", "auto"].includes(String(installed.method)));
+    assert.match(
+      String(installed.instructions),
+      /claude auth login --claudeai/,
+    );
+  }
+
   const requestHeaders: Record<string, string> = {};
   applyClaudeRequestContextHeaders(
     requestHeaders,

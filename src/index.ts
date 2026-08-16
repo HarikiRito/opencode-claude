@@ -18,6 +18,7 @@ import {
   PROVIDER_ID,
 } from "./constants.js";
 import { detectClaudeCode } from "./detect.js";
+import { installClaudeCli } from "./cli-install.js";
 import {
   startClaudeCliLogin,
   submitClaudeCliLoginCode,
@@ -234,10 +235,16 @@ async function loadClaudeRuntime(
 
 /**
  * OpenCode plugin that provides Claude Code authentication and model access.
+ *
+ * The auth methods are chosen once at load from the CLI's presence: a host
+ * with `claude` gets the sign-in relay, a host without it gets the install
+ * action. `authorize` re-detects at run time, so the install action still
+ * relays the sign-in right after a successful install.
  */
 export const ClaudeCodePlugin: Plugin = async (
   input: PluginInput,
 ): Promise<Hooks> => {
+  const cliPresent = await probeCliPresence();
   return {
     async config(config) {
       // Bind first (ephemeral port by default), then seed provider baseURL so
@@ -295,90 +302,180 @@ export const ClaudeCodePlugin: Plugin = async (
 
     auth: {
       provider: PROVIDER_ID,
-
-      methods: [
-        {
-          type: "oauth",
-          label: "Sign in with Claude Code CLI",
-          /**
-           * The official CLI runs the whole flow; the host only relays it.
-           * `claude auth login --claudeai` prints an authorize URL and then
-           * waits on stdin for the code the Claude page shows, so the host UI
-           * can open that URL and pass the pasted code straight through —
-           * no separate terminal, and no OAuth implemented here.
-           *
-           * The only URL this method ever hands out is the CLI's own sign-in
-           * page: any other link would open a tab that cannot finish the
-           * sign-in, competing with the page the user actually has to use.
-           */
-          async authorize() {
-            const detection = await detectClaudeCode();
-            if (detection.loggedIn) {
-              return {
-                url: "",
-                instructions: "Claude Code CLI is already signed in. Click Complete.",
-                method: "auto" as const,
-                async callback() {
-                  // OpenCode's callback runtime stores credentials only when
-                  // success includes key or refresh. Claude CLI needs neither.
-                  return { type: "success" as const } as any;
-                },
-              };
-            }
-
-            const launch = await startClaudeCliLogin({ cwd: input.directory });
-            if (launch.state === "awaiting-code") {
-              return {
-                url: launch.url,
-                instructions:
-                  "Sign in on the Claude page that opened and paste the code it shows here. If the page did not open, use the sign-in link above — or run `claude auth login --claudeai` in a terminal instead and start this sign-in again.",
-                method: "code" as const,
-                async callback(code: string) {
-                  const submitted = await submitClaudeCliLoginCode(code);
-                  if (submitted.ok) return { type: "success" as const } as any;
-                  log.warn("[opencode-claude] Claude CLI login code rejected", {
-                    message: submitted.message,
-                  });
-                  // The CLI can store its grant and still exit oddly; trust
-                  // its own auth status over the exit code before failing.
-                  const verified = await detectClaudeCode();
-                  if (verified.loggedIn) {
-                    return { type: "success" as const } as any;
-                  }
-                  return { type: "failed" as const };
-                },
-              };
-            }
-
-            log.warn("[opencode-claude] Claude CLI login launch failed", {
-              message: launch.message,
-            });
-            // A missing CLI, or one whose prompt we could not read, lands here:
-            // fall back to the terminal and watch `claude auth status`. There
-            // is no page to open, so no URL is offered.
-            return {
-              url: "",
-              instructions: `${launch.message} Run \`claude auth login --claudeai\` in a terminal, then click Complete.`,
-              method: "auto" as const,
-              async callback() {
-                const deadline = Date.now() + 5 * 60_000;
-                while (Date.now() < deadline) {
-                  const detection = await detectClaudeCode();
-                  if (detection.loggedIn) {
-                    return { type: "success" as const } as any;
-                  }
-                  await new Promise((resolve) => setTimeout(resolve, 1_000));
-                }
-                log.warn("[opencode-claude] Claude CLI login timed out");
-                return { type: "failed" as const };
-              },
-            };
-          },
-        },
-      ],
+      methods: buildAuthMethods(cliPresent, input.directory),
     },
   };
 };
+
+/**
+ * The method list mirrors what the host actually needs: only the sign-in relay
+ * when the CLI is there, only the install action when it is not. Each
+ * `authorize` re-detects, so the install action rolls straight into the relay
+ * after a successful install without a restart.
+ */
+export function buildAuthMethods(cliPresent: boolean, directory: string) {
+  if (!cliPresent) {
+    return [
+      {
+        type: "oauth" as const,
+        label: "Install Claude Code CLI and sign in",
+        /**
+         * One-click path for hosts without the CLI: install the official
+         * Claude Code CLI, then continue with the same sign-in relay. Users
+         * who prefer the terminal get the install and auth commands in the
+         * instructions instead.
+         */
+        async authorize() {
+          const detection = await detectClaudeCode();
+          if (detection.loggedIn) {
+            return alreadySignedInResponse();
+          }
+          if (detection.status === "missing-cli") {
+            const install = await installClaudeCli();
+            if (!install.ok) {
+              log.warn("[opencode-claude] Claude CLI install failed", {
+                message: install.message,
+              });
+              return manualInstallResponse(install.message);
+            }
+          } else if (detection.status === "missing-sdk") {
+            return manualInstallResponse(
+              "The Claude Agent SDK is unavailable in this plugin install. Reinstall the plugin, then sign in again.",
+            );
+          }
+          return relayOrFallback(
+            await startClaudeCliLogin({ cwd: directory }),
+          );
+        },
+      },
+    ];
+  }
+
+  return [
+    {
+      type: "oauth" as const,
+      label: "Sign in with Claude Code CLI",
+      /**
+       * The official CLI runs the whole flow; the host only relays it.
+       * `claude auth login --claudeai` prints an authorize URL and then
+       * waits on stdin for the code the Claude page shows, so the host UI
+       * can open that URL and pass the pasted code straight through —
+       * no separate terminal, and no OAuth implemented here.
+       *
+       * The only URL this method ever hands out is the CLI's own sign-in
+       * page: any other link would open a tab that cannot finish the
+       * sign-in, competing with the page the user actually has to use.
+       */
+      async authorize() {
+        const detection = await detectClaudeCode();
+        if (detection.loggedIn) {
+          return alreadySignedInResponse();
+        }
+        return relayOrFallback(await startClaudeCliLogin({ cwd: directory }));
+      },
+    },
+  ];
+}
+
+/**
+ * CLI presence check for the method list, capped so a slow probe can never
+ * block plugin load. Unknown results default to "present": the sign-in relay
+ * re-detects and falls back to terminal instructions if the CLI is actually
+ * missing.
+ */
+async function probeCliPresence(): Promise<boolean> {
+  try {
+    const detection = await Promise.race([
+      detectClaudeCode(),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 3000)),
+    ]);
+    return detection ? detection.status !== "missing-cli" : true;
+  } catch {
+    return true;
+  }
+}
+
+function alreadySignedInResponse() {
+  return {
+    url: "",
+    instructions:
+      "Claude Code CLI is already signed in. Click Complete — or sign in from a terminal instead with `claude auth login --claudeai`.",
+    method: "auto" as const,
+    async callback() {
+      // OpenCode's callback runtime stores credentials only when success
+      // includes key or refresh. Claude CLI needs neither.
+      return { type: "success" as const } as any;
+    },
+  };
+}
+
+/**
+ * The `code` method response: the host opens the CLI's authorize URL and the
+ * user pastes the code from the Claude page back into the host, which writes
+ * it to the CLI's stdin. Success is the CLI's own exit status.
+ */
+function relayOrFallback(
+  launch: Awaited<ReturnType<typeof startClaudeCliLogin>>,
+) {
+  if (launch.state === "awaiting-code") {
+    return {
+      url: launch.url,
+      instructions:
+        "Sign in on the Claude page that opened and paste the code it shows here — or sign in from a terminal instead with `claude auth login --claudeai` and start this sign-in again. If the page did not open, use the sign-in link above.",
+      method: "code" as const,
+      async callback(code: string) {
+        const submitted = await submitClaudeCliLoginCode(code);
+        if (submitted.ok) return { type: "success" as const } as any;
+        log.warn("[opencode-claude] Claude CLI login code rejected", {
+          message: submitted.message,
+        });
+        // The CLI can store its grant and still exit oddly; trust its own
+        // auth status over the exit code before failing.
+        const verified = await detectClaudeCode();
+        if (verified.loggedIn) {
+          return { type: "success" as const } as any;
+        }
+        return { type: "failed" as const };
+      },
+    };
+  }
+
+  log.warn("[opencode-claude] Claude CLI login launch failed", {
+    message: launch.message,
+  });
+  return manualInstallResponse(launch.message);
+}
+
+/**
+ * No page to open: the user installs and signs in from a terminal (or via the
+ * install action), and the callback watches `claude auth status` until the
+ * grant lands. The message always names both the install and the auth command.
+ */
+function manualInstallResponse(launchMessage: string) {
+  return {
+    url: "",
+    instructions: `${launchMessage}
+Install Claude Code, sign in, then click Complete:
+
+  npm install -g @anthropic-ai/claude-code
+  claude auth login --claudeai
+
+Or use the “Install Claude Code CLI and sign in” action here instead.`,
+    method: "auto" as const,
+    async callback() {
+      const deadline = Date.now() + 10 * 60_000;
+      while (Date.now() < deadline) {
+        const detection = await detectClaudeCode();
+        if (detection.loggedIn) {
+          return { type: "success" as const } as any;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1_000));
+      }
+      log.warn("[opencode-claude] Claude CLI login timed out");
+      return { type: "failed" as const };
+    },
+  };
+}
 
 export default ClaudeCodePlugin;
 

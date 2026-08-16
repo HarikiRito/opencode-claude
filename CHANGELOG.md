@@ -14,6 +14,21 @@
   sign-in is either the link plus its code, or `claude auth login --claudeai`
   in a terminal. The terminal fallback is still offered on its own when the CLI
   is missing or its prompt cannot be read.
+- **One-click CLI install**: a new provider action, **Install Claude Code CLI
+  and sign in**, runs the official installer (`npm install -g
+  @anthropic-ai/claude-code`, with Anthropic's install script as fallback) when
+  the CLI is missing and then continues straight into the sign-in relay. The
+  regular sign-in method now also prints both install and auth commands in its
+  terminal fallback instead of only the auth command.
+- **CLI resolution beyond PATH**: the CLI is looked up on PATH first, then in
+  the official installer's `~/.local/bin` and the npm global bin, so an
+  install that the managed OpenChamber server PATH cannot see is still found.
+- **Methods match what the host needs**: the provider lists only **Sign in
+  with Claude Code CLI** when `claude` is present, and only **Install Claude
+  Code CLI and sign in** when it is missing — the install action is never
+  shown to a host that already has a working CLI. The terminal alternative
+  (`claude auth login --claudeai`) is always called out in the instructions
+  on every path.
 
 ## 0.12.0 - 2026-08-15
 

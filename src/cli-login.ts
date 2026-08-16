@@ -21,7 +21,7 @@
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import { buildClaudeCodeChildEnv } from "./auth-env.js";
-import { findBinaryOnPath } from "./executable-path.js";
+import { resolveClaudeCli } from "./executable-path.js";
 
 export type ClaudeCliLoginStatus =
   | { state: "idle" }
@@ -139,12 +139,13 @@ export async function startClaudeCliLogin(options?: {
     const env = buildClaudeCodeChildEnv(options?.env ?? process.env);
     const binaryPath =
       options?.binaryPath === undefined
-        ? findBinaryOnPath("claude", env)
+        ? resolveClaudeCli(env)
         : options.binaryPath;
     if (!binaryPath) {
       status = {
         state: "failed",
-        message: "Claude Code CLI (`claude`) was not found on PATH.",
+        message:
+          "Claude Code CLI (`claude`) was not found — install it via the provider's install action or with `npm install -g @anthropic-ai/claude-code`.",
       };
       return status;
     }

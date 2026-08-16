@@ -3,7 +3,7 @@
  */
 import { spawnSync } from "node:child_process";
 import { buildClaudeCodeChildEnv } from "./auth-env.js";
-import { findBinaryOnPath } from "./executable-path.js";
+import { resolveClaudeCli } from "./executable-path.js";
 import { probeClaudeAgentSdk } from "./query.js";
 
 export type ClaudeDetectStatus =
@@ -109,12 +109,13 @@ export async function detectClaudeCode(options?: {
   const binaryPath =
     options?.binaryPath !== undefined
       ? options.binaryPath
-      : findBinaryOnPath("claude", env);
+      : resolveClaudeCli(env);
 
   if (!binaryPath) {
     return {
       status: "missing-cli",
-      statusDetail: "Claude Code CLI (`claude`) not found on PATH",
+      statusDetail:
+        "Claude Code CLI (`claude`) not found — install it via the provider's install action or with `npm install -g @anthropic-ai/claude-code`.",
       binaryPath: null,
       version: null,
       sdkAvailable: false,
