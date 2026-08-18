@@ -1709,6 +1709,156 @@ async function main() {
     }
   }
 
+  // ---- Turn stall watchdog + client-cancel teardown + CLI resolution cache ----
+  {
+    const { setClaudeQueryStarter } = await import("../src/proxy.ts");
+    const { mkdtempSync, rmSync, writeFileSync, chmodSync, unlinkSync } =
+      await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join: joinPath } = await import("node:path");
+    const { resolveClaudeCli, resetClaudeCliResolutionCache } = await import(
+      "../src/executable-path.ts"
+    );
+
+    const postStream = (sessionHeader: string) =>
+      fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-opencode-claude-session": sessionHeader,
+        },
+        body: JSON.stringify({
+          model: "sonnet",
+          stream: true,
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      });
+
+    const prevStallEnv = process.env.OPENCODE_CLAUDE_TURN_STALL_MS;
+    process.env.OPENCODE_CLAUDE_TURN_STALL_MS = "2000";
+    try {
+      // A turn that goes silent after init must fail truthfully (HTTP 500
+      // via the pre-content probe), not hold the response open forever.
+      let stalledCloseCalled = false;
+      setClaudeQueryStarter(async () => ({
+        stream: (async function* () {
+          yield { type: "system", subtype: "init", session_id: "stall-sess" };
+          await new Promise(() => {}); // never produces another event
+        })(),
+        interrupt: async () => {},
+        close: () => {
+          stalledCloseCalled = true;
+        },
+        getPid: () => null,
+      }));
+      const stallStarted = Date.now();
+      const stallRes = await postStream("smoke-stall");
+      assert.equal(
+        stallRes.status,
+        500,
+        "silent turn must fail with a truthful HTTP error",
+      );
+      const stallJson = (await stallRes.json()) as {
+        error?: { message?: string };
+      };
+      assert.match(String(stallJson.error?.message ?? ""), /no output/);
+      assert.ok(
+        Date.now() - stallStarted < 15_000,
+        "stall watchdog took too long to fire",
+      );
+      assert.ok(stalledCloseCalled, "stalled turn must close the CLI handle");
+
+      // Client disconnect mid-turn must tear the turn down (close handle)
+      // instead of leaking a live CLI + bridge nobody can resume. The stall
+      // watchdog is moved out of the way so only cancel() can do it.
+      process.env.OPENCODE_CLAUDE_TURN_STALL_MS = "60000";
+      let cancelCloseCalled = false;
+      setClaudeQueryStarter(async () => ({
+        stream: (async function* () {
+          yield {
+            type: "stream_event",
+            event: {
+              type: "content_block_delta",
+              delta: { type: "text_delta", text: "FIRST_CHUNK" },
+            },
+          };
+          await new Promise(() => {}); // turn continues forever
+        })(),
+        interrupt: async () => {},
+        close: () => {
+          cancelCloseCalled = true;
+        },
+        getPid: () => null,
+      }));
+      const abort = new AbortController();
+      const cancelRes = await fetch(
+        `http://127.0.0.1:${port}/v1/chat/completions`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-opencode-claude-session": "smoke-cancel",
+          },
+          body: JSON.stringify({
+            model: "sonnet",
+            stream: true,
+            messages: [{ role: "user", content: "hi" }],
+          }),
+          signal: abort.signal,
+        },
+      );
+      assert.equal(cancelRes.status, 200);
+      const reader = cancelRes.body!.getReader();
+      const first = await reader.read();
+      assert.match(new TextDecoder().decode(first.value), /FIRST_CHUNK/);
+      // A real client abort (OpenCode timeout/session stop) destroys the
+      // socket — the server-side stream must observe it via cancel().
+      abort.abort();
+      const cancelDeadline = Date.now() + 5_000;
+      while (!cancelCloseCalled && Date.now() < cancelDeadline) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      assert.ok(
+        cancelCloseCalled,
+        "client cancel must close the orphaned CLI handle",
+      );
+    } finally {
+      setClaudeQueryStarter(null);
+      if (prevStallEnv === undefined) {
+        delete process.env.OPENCODE_CLAUDE_TURN_STALL_MS;
+      } else {
+        process.env.OPENCODE_CLAUDE_TURN_STALL_MS = prevStallEnv;
+      }
+    }
+
+    // CLI resolution is memoized per PATH+HOME: re-probing spawns sync
+    // child processes that hard-block the host's event loop on every query.
+    const binDir = mkdtempSync(joinPath(tmpdir(), "oc-claude-bin-"));
+    try {
+      const fakeCli = joinPath(binDir, "claude");
+      writeFileSync(fakeCli, "#!/bin/sh\necho 9.9.9-smoke\n");
+      chmodSync(fakeCli, 0o755);
+      // HOME points at the temp dir so the well-known-location fallback
+      // (~/.local/bin/claude on this dev box) cannot mask a negative result.
+      const env = { PATH: binDir, HOME: binDir };
+      resetClaudeCliResolutionCache();
+      const first = resolveClaudeCli(env);
+      assert.ok(first && first.endsWith("claude"), "fake CLI resolved");
+      unlinkSync(fakeCli);
+      const second = resolveClaudeCli(env);
+      assert.equal(second, first, "resolution must be memoized");
+      resetClaudeCliResolutionCache();
+      assert.equal(
+        resolveClaudeCli(env),
+        null,
+        "cache reset must re-probe (and negatives stay uncached)",
+      );
+      resetClaudeCliResolutionCache();
+    } finally {
+      rmSync(binDir, { recursive: true, force: true });
+    }
+  }
+
   await stopProxy();
 
   // TypeScript build

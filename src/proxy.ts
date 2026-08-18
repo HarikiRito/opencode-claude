@@ -78,6 +78,18 @@ import {
 const SHARED_PROXY_HEALTH_TIMEOUT_MS = 750;
 
 /**
+ * Max silence from the Claude Agent SDK before the turn is declared dead.
+ * Read per request so tests and operators can tune it without a rebuild.
+ * A silent stream holds the SSE response open forever (idleTimeout is 0 by
+ * design), which wedges the OpenCode session as "busy" until the host's
+ * supervisor force-restarts the whole server — the 2026-08-18 hang.
+ */
+function turnStallMs(): number {
+  const raw = Number(process.env.OPENCODE_CLAUDE_TURN_STALL_MS);
+  return Number.isFinite(raw) && raw >= 1_000 ? raw : 600_000;
+}
+
+/**
  * Bun.serve defaults to 10s and RSTs idle sockets. OpenCode maps that to a
  * retryable "Connection reset by server". This proxy holds the HTTP response
  * until the Claude turn proves alive, and SSE can pause during thinking —
@@ -667,11 +679,48 @@ async function handleChatCompletions(
           };
         });
 
+        // Watchdog: total silence from the CLI (dead process, stuck compact,
+        // wedged SDK) must fail the turn truthfully instead of parking the
+        // session forever. Any event — or a park — resets the clock.
+        let stallTimer: ReturnType<typeof setTimeout> | null = null;
+        const stallPromise = new Promise<never>((_, reject) => {
+          const ms = turnStallMs();
+          const span =
+            ms < 90_000
+              ? `${Math.round(ms / 1000)}s`
+              : `${Math.round(ms / 60000)}m`;
+          stallTimer = setTimeout(() => {
+            reject(
+              new Error(
+                `Claude Code produced no output for ${span} — the turn was killed. Retry the message.`,
+              ),
+            );
+          }, ms);
+          stallTimer.unref?.();
+        });
+
         const nextPromise = iterator.next();
-        const raced = await Promise.race([
-          nextPromise.then((value) => ({ kind: "event" as const, value })),
-          parkPromise.then(() => ({ kind: "park" as const })),
-        ]);
+        let raced:
+          | { kind: "event"; value: IteratorResult<unknown> }
+          | { kind: "park" };
+        try {
+          raced = await Promise.race([
+            nextPromise.then((value) => ({ kind: "event" as const, value })),
+            parkPromise.then(() => ({ kind: "park" as const })),
+            stallPromise,
+          ]);
+        } catch (error) {
+          // Stall watchdog fired — the turn is dead. Swallow the late
+          // iterator settlement so it cannot surface as an unhandled
+          // rejection after we throw.
+          nextPromise.then(
+            () => {},
+            () => {},
+          );
+          throw error;
+        } finally {
+          if (stallTimer) clearTimeout(stallTimer);
+        }
 
         if (raced.kind === "park" || (parked && pendingTools.size > 0)) {
           parkControl.cancel?.();
@@ -1161,24 +1210,30 @@ function streamOpenAIResponse(
   const created = Math.floor(Date.now() / 1000);
 
   const encoder = new TextEncoder();
+  // Hoisted so cancel() can stop a turn whose client went away: without it
+  // an aborted fetch leaves the CLI running and the bridge parked forever.
+  let streamClosed = false;
+  let heartbeat: ReturnType<typeof setInterval> | null = null;
+  let controllerRef: ReadableStreamDefaultController<Uint8Array> | null = null;
+  const send = (payload: unknown) => {
+    if (streamClosed || !controllerRef) return;
+    controllerRef.enqueue(
+      encoder.encode(`data: ${JSON.stringify(payload)}\n\n`),
+    );
+  };
   const readable = new ReadableStream({
     async start(controller) {
-      const send = (payload: unknown) => {
-        controller.enqueue(
-          encoder.encode(`data: ${JSON.stringify(payload)}\n\n`),
-        );
-      };
+      controllerRef = controller;
 
       // Keep the socket busy during thinking pauses. Complements idleTimeout: 0
       // for any hop that still kills silent SSE connections.
-      let streamClosed = false;
-      const heartbeat = setInterval(() => {
+      heartbeat = setInterval(() => {
         if (streamClosed) return;
         try {
           controller.enqueue(encoder.encode(": ping\n\n"));
         } catch {
           streamClosed = true;
-          clearInterval(heartbeat);
+          if (heartbeat) clearInterval(heartbeat);
         }
       }, SSE_HEARTBEAT_MS);
       heartbeat.unref?.();
@@ -1347,20 +1402,34 @@ function streamOpenAIResponse(
       }
 
       const usage = resolveTurnUsage(turnUsage, resultUsage);
-      send({
-        id: completionId,
-        object: "chat.completion.chunk",
-        created,
-        model,
-        choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
-        ...(usage ? { usage } : {}),
-      });
-      controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-      controller.close();
+      if (!streamClosed) {
+        send({
+          id: completionId,
+          object: "chat.completion.chunk",
+          created,
+          model,
+          choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+          ...(usage ? { usage } : {}),
+        });
+        try {
+          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+          controller.close();
+        } catch {
+          // client already gone
+        }
+      }
       } finally {
         streamClosed = true;
-        clearInterval(heartbeat);
+        if (heartbeat) clearInterval(heartbeat);
       }
+    },
+    cancel() {
+      // The client (OpenCode) aborted the fetch mid-turn. Nothing will
+      // consume the rest and nobody can resume a parked tool call, so tear
+      // the turn down instead of leaking the CLI process and the bridge.
+      streamClosed = true;
+      if (heartbeat) clearInterval(heartbeat);
+      deleteBridge(bridge.id);
     },
   });
 

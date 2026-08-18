@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.13.1 - 2026-08-18
+
+- **Fix: turn stall watchdog** — a Claude turn that went totally silent (dead
+  CLI, wedged SDK, stuck compact) held the SSE response open forever, leaving
+  the OpenCode session "busy" until the host supervisor force-restarted the
+  whole server mid-turn (the 2026-08-18 session hang). Any event gap longer
+  than `OPENCODE_CLAUDE_TURN_STALL_MS` (default 10m) now kills the turn and
+  answers with a truthful error instead.
+- **Fix: client disconnect tears the turn down** — the SSE stream now has a
+  `cancel()` handler: when OpenCode aborts the fetch mid-turn, the CLI handle
+  is closed and the parked bridge dropped instead of leaking a live CLI
+  process nobody can resume.
+- **Fix: CLI resolution is memoized** — `resolveClaudeCli` ran synchronous
+  process probes (`npm prefix -g`, `claude --version`) on every Agent SDK
+  query, hard-blocking the host's event loop for ~1s per turn (worse on the
+  managed server, whose PATH lacks `claude`). Resolution is now cached per
+  PATH+HOME; only the first query pays.
+
 ## 0.13.0 - 2026-08-16
 
 - **Sign in without leaving the host**: the provider sign-in action now relays

@@ -78,16 +78,36 @@ export function findBinaryOnPath(
 /**
  * `claude` as the managed server sees it: PATH first, then the install
  * locations that a clean server environment usually cannot see.
+ *
+ * Resolution is memoized per PATH+HOME: each probe is a synchronous spawn
+ * (`npm prefix -g`, `claude --version`) that hard-blocks the host's event
+ * loop, and this runs on every Agent SDK query. On a shared long-lived
+ * server (OpenChamber's health probe has a 5s timeout) repeated second-long
+ * stalls stack into health-check failures and forced restarts.
  */
+let cachedResolution: { key: string; path: string | null } | null = null;
+
 export function resolveClaudeCli(
   env: NodeJS.ProcessEnv | Record<string, string | undefined> = process.env,
 ): string | null {
-  const onPath = findBinaryOnPath("claude", env);
-  if (onPath) return onPath;
-  for (const candidate of knownClaudeLocations(env)) {
-    if (probeClaude(candidate, env)) return candidate;
+  const key = `${env.PATH ?? ""}${env.HOME ?? ""}`;
+  if (cachedResolution && cachedResolution.key === key) {
+    return cachedResolution.path;
   }
-  return null;
+  const onPath = findBinaryOnPath("claude", env);
+  const resolved =
+    onPath ??
+    knownClaudeLocations(env).find((candidate) => probeClaude(candidate, env)) ??
+    null;
+  // Only positive hits are memoized — a CLI installed mid-process (the
+  // one-click install action) must be found on the next detect.
+  if (resolved) cachedResolution = { key, path: resolved };
+  return resolved;
+}
+
+/** Test hook: drop the memoized resolution. */
+export function resetClaudeCliResolutionCache(): void {
+  cachedResolution = null;
 }
 
 export function resolveClaudeCodeExecutable(options?: {
