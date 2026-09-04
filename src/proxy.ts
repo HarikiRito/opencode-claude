@@ -827,6 +827,9 @@ function extractSessionId(event: unknown): string | null {
   return null;
 }
 
+/** Matches the MCP server name registered in buildOpenCodeMcpServer. */
+const OPENCODE_MCP_TOOL_PREFIX = "mcp__opencode__";
+
 /**
  * The Agent SDK streams one assistant event per completed content block, so a
  * turn with N parallel tool_use requests arrives as N separate events sharing
@@ -846,9 +849,15 @@ function extractToolUseBlocks(
     if (!block || typeof block !== "object") continue;
     const b = block as Record<string, unknown>;
     if (b.type !== "tool_use" || typeof b.id !== "string") continue;
+    const rawName = typeof b.name === "string" ? b.name : "";
     blocks.push({
       id: b.id,
-      name: typeof b.name === "string" ? b.name : "",
+      // Claude names MCP tool_use blocks by their fully-qualified MCP id
+      // (mcp__<server>__<tool>); OpenCode registered the bare tool name and
+      // won't recognize the qualified form when we report the call back.
+      name: rawName.startsWith(OPENCODE_MCP_TOOL_PREFIX)
+        ? rawName.slice(OPENCODE_MCP_TOOL_PREFIX.length)
+        : rawName,
       arguments: JSON.stringify(b.input ?? {}),
     });
   }
