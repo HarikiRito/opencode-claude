@@ -1331,34 +1331,29 @@ function streamOpenAIResponse(
           const mapped = mapSdkEvent(event);
           if (mapped.kind === "park") {
             finishReason = "tool_calls";
-            for (let i = 0; i < mapped.tools.length; i++) {
-              const tool = mapped.tools[i];
-              send({
-                id: completionId,
-                object: "chat.completion.chunk",
-                created,
-                model,
-                choices: [
-                  {
-                    index: 0,
-                    delta: {
-                      tool_calls: [
-                        {
-                          index: i,
-                          id: tool.id,
-                          type: "function",
-                          function: {
-                            name: tool.name,
-                            arguments: tool.arguments,
-                          },
-                        },
-                      ],
-                    },
-                    finish_reason: null,
+            send({
+              id: completionId,
+              object: "chat.completion.chunk",
+              created,
+              model,
+              choices: [
+                {
+                  index: 0,
+                  delta: {
+                    tool_calls: mapped.tools.map((tool, i) => ({
+                      index: i,
+                      id: tool.id,
+                      type: "function",
+                      function: {
+                        name: tool.name,
+                        arguments: tool.arguments,
+                      },
+                    })),
                   },
-                ],
-              });
-            }
+                  finish_reason: null,
+                },
+              ],
+            });
             break;
           }
 
