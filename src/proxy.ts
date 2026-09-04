@@ -438,9 +438,31 @@ async function handleChatCompletions(
     process.env.OPENCODE_CLAUDE_CWD || requestDirectory || process.cwd();
   const bridgeId = randomUUID();
   const pendingTools = new Map<string, ParkedToolCall>();
+  // Tool_use blocks are streamed one per assistant event, all before the SDK
+  // dispatches any handler, but handlers are then invoked serially — awaiting
+  // handler #1 before starting #2. Registering every block as it streams in
+  // (see registerToolUseBlocks) lets the first handler's park emit the whole
+  // batch instead of just the one tool the SDK has gotten around to calling.
+  const toolResultPromises = new Map<string, Promise<string>>();
+  const toolIdQueue: string[] = [];
   let handle: ClaudeQueryHandle | null = null;
   let parked = false;
   let parkWaiters: Array<() => void> = [];
+
+  const registerToolUseBlocks = (event: unknown): void => {
+    for (const block of extractToolUseBlocks(event)) {
+      if (pendingTools.has(block.id)) continue;
+      let resolveFn!: (result: string) => void;
+      let rejectFn!: (error: Error) => void;
+      const promise = new Promise<string>((resolve, reject) => {
+        resolveFn = resolve;
+        rejectFn = reject;
+      });
+      pendingTools.set(block.id, { ...block, resolve: resolveFn, reject: rejectFn });
+      toolResultPromises.set(block.id, promise);
+      toolIdQueue.push(block.id);
+    }
+  };
 
   const notifyPark = () => {
     parked = true;
@@ -544,7 +566,13 @@ async function handleChatCompletions(
 
   const mcpServers =
     !isMetaRequest && openCodeTools.length > 0
-      ? await buildOpenCodeMcpServer(openCodeTools, pendingTools, notifyPark)
+      ? await buildOpenCodeMcpServer(
+          openCodeTools,
+          pendingTools,
+          toolResultPromises,
+          toolIdQueue,
+          notifyPark,
+        )
       : undefined;
 
   const bridgeOpenCodeTools = !isMetaRequest && openCodeTools.length > 0;
@@ -738,6 +766,7 @@ async function handleChatCompletions(
                 cwd,
               });
             }
+            registerToolUseBlocks(pendingEvent);
             yield pendingEvent;
           }
           yield { type: "__park__", tools: [...pendingTools.values()] };
@@ -754,6 +783,7 @@ async function handleChatCompletions(
             cwd,
           });
         }
+        registerToolUseBlocks(event);
         yield event;
       }
     } finally {
@@ -797,9 +827,39 @@ function extractSessionId(event: unknown): string | null {
   return null;
 }
 
+/**
+ * The Agent SDK streams one assistant event per completed content block, so a
+ * turn with N parallel tool_use requests arrives as N separate events sharing
+ * a message id, all before the SDK starts invoking any handler.
+ */
+function extractToolUseBlocks(
+  event: unknown,
+): Array<{ id: string; name: string; arguments: string }> {
+  if (!event || typeof event !== "object") return [];
+  const e = event as Record<string, unknown>;
+  if (e.type !== "assistant") return [];
+  const message = e.message as Record<string, unknown> | undefined;
+  const content = message?.content;
+  if (!Array.isArray(content)) return [];
+  const blocks: Array<{ id: string; name: string; arguments: string }> = [];
+  for (const block of content) {
+    if (!block || typeof block !== "object") continue;
+    const b = block as Record<string, unknown>;
+    if (b.type !== "tool_use" || typeof b.id !== "string") continue;
+    blocks.push({
+      id: b.id,
+      name: typeof b.name === "string" ? b.name : "",
+      arguments: JSON.stringify(b.input ?? {}),
+    });
+  }
+  return blocks;
+}
+
 async function buildOpenCodeMcpServer(
   tools: OpenAITool[],
   pendingTools: Map<string, ParkedToolCall>,
+  toolResultPromises: Map<string, Promise<string>>,
+  toolIdQueue: string[],
   onPark: () => void,
 ): Promise<Record<string, unknown> | undefined> {
   try {
@@ -895,6 +955,21 @@ async function buildOpenCodeMcpServer(
           description,
           shape,
           async (args: Record<string, unknown>) => {
+            // The block for this call was likely already registered (as the
+            // SDK streamed the assistant message) under Claude's own
+            // tool_use id, queued in dispatch order. Reuse it so the park
+            // response carries every id from the batch, not just this one.
+            const queuedId = toolIdQueue.shift();
+            const resultPromise = queuedId
+              ? toolResultPromises.get(queuedId)
+              : undefined;
+            if (queuedId && resultPromise) {
+              toolResultPromises.delete(queuedId);
+              onPark();
+              const result = await resultPromise;
+              return { content: [{ type: "text", text: result }] };
+            }
+
             const id = `call_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
             const pending: ParkedToolCall = {
               id,
@@ -903,14 +978,14 @@ async function buildOpenCodeMcpServer(
               resolve: () => {},
               reject: () => {},
             };
-            const resultPromise = new Promise<string>((resolve, reject) => {
+            const fallbackPromise = new Promise<string>((resolve, reject) => {
               pending.resolve = resolve;
               pending.reject = reject;
             });
             // Register before notifying so the stream consumer sees the tool.
             pendingTools.set(id, pending);
             onPark();
-            const result = await resultPromise;
+            const result = await fallbackPromise;
             return {
               content: [{ type: "text", text: result }],
             };
