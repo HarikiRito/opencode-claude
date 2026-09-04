@@ -410,8 +410,12 @@ async function handleChatCompletions(
         pending: existing.pendingTools.size,
         resolved,
       });
+      // Snapshot now, not inside the generator — the generator body only
+      // runs once the response starts streaming, and a concurrent resume
+      // request can fully drain existing.pendingTools before then.
+      const parkedTools = [...existing.pendingTools.values()];
       const parkedEvents = (async function* () {
-        yield { type: "__park__", tools: [...existing!.pendingTools.values()] };
+        yield { type: "__park__", tools: parkedTools };
       })();
       return stream
         ? streamOpenAIResponse(parkedEvents, body.model || model, existing)
@@ -752,13 +756,13 @@ async function handleChatCompletions(
 
         if (raced.kind === "park" || (parked && pendingTools.size > 0)) {
           parkControl.cancel?.();
-          await Promise.resolve();
           // The iterator's pending next() may already have consumed the
           // assistant event that carries the parked tool call (and its
           // per-call usage). Forward it before parking so usage accounting
           // and session binding stay intact.
+          let pendingEvent: unknown;
           if (raced.kind === "event" && !raced.value.done) {
-            const pendingEvent = raced.value.value;
+            pendingEvent = raced.value.value;
             const pendingSessionId = extractSessionId(pendingEvent);
             if (pendingSessionId) {
               setForeignSessionId(conversationKey, pendingSessionId, {
@@ -767,9 +771,15 @@ async function handleChatCompletions(
               });
             }
             registerToolUseBlocks(pendingEvent);
-            yield pendingEvent;
           }
-          yield { type: "__park__", tools: [...pendingTools.values()] };
+          // Snapshot synchronously, right here — a concurrent resume request
+          // for this same bridge can drain pendingTools between this check
+          // and a later await, and yielding an empty batch with
+          // finish_reason "tool_calls" desyncs OpenCode's agent loop into
+          // silently re-issuing the same tool calls forever.
+          const parkedTools = [...pendingTools.values()];
+          if (pendingEvent !== undefined) yield pendingEvent;
+          yield { type: "__park__", tools: parkedTools };
           return;
         }
 
