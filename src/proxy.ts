@@ -813,6 +813,49 @@ async function buildOpenCodeMcpServer(
       return undefined;
     }
 
+    const jsonSchemaToZodType = (
+      schema: Record<string, unknown> | undefined,
+    ): unknown => {
+      if (!schema || typeof schema !== "object") return z.any();
+
+      if (Array.isArray(schema.enum) && schema.enum.length > 0) {
+        const literals = schema.enum.map((v) => z.literal(v as never));
+        return literals.length === 1
+          ? literals[0]
+          : z.union(literals as [unknown, unknown, ...unknown[]] as never);
+      }
+      if (Array.isArray(schema.anyOf) && schema.anyOf.length > 0) {
+        const options = schema.anyOf.map((sub) =>
+          jsonSchemaToZodType(sub as Record<string, unknown>),
+        );
+        return options.length === 1
+          ? options[0]
+          : z.union(options as [unknown, unknown, ...unknown[]] as never);
+      }
+
+      switch (schema.type) {
+        case "string":
+          return z.string();
+        case "number":
+        case "integer":
+          return z.number();
+        case "boolean":
+          return z.boolean();
+        case "array":
+          return z.array(
+            jsonSchemaToZodType(
+              schema.items as Record<string, unknown> | undefined,
+            ) as never,
+          );
+        case "object":
+          return z.object(
+            jsonSchemaToZodShape(schema) as Record<string, never>,
+          );
+        default:
+          return z.any();
+      }
+    };
+
     const jsonSchemaToZodShape = (
       schema: Record<string, unknown> | undefined,
     ): Record<string, unknown> => {
@@ -830,16 +873,7 @@ async function buildOpenCodeMcpServer(
       );
       const shape: Record<string, unknown> = {};
       for (const [key, prop] of Object.entries(props)) {
-        const type =
-          prop && typeof prop === "object"
-            ? (prop as { type?: unknown }).type
-            : undefined;
-        let field: unknown = z.any();
-        if (type === "string") field = z.string();
-        else if (type === "number" || type === "integer") field = z.number();
-        else if (type === "boolean") field = z.boolean();
-        else if (type === "array") field = z.array(z.any());
-        else if (type === "object") field = z.record(z.string(), z.any());
+        let field = jsonSchemaToZodType(prop as Record<string, unknown>);
         if (!required.has(key)) {
           field = (field as { optional: () => unknown }).optional();
         }
