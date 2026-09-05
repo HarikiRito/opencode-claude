@@ -9,6 +9,7 @@
  * tool_calls; the follow-up request with tool results resumes the turn.
  */
 import { createHash, randomUUID } from "node:crypto";
+import { z } from "zod";
 import {
   deleteBridge,
   findBridgeByConversation,
@@ -894,6 +895,371 @@ function isMessageStreamEnd(event: unknown): boolean {
   return ev.type === "message_delta" || ev.type === "message_stop";
 }
 
+type JsonSchema = Record<string, unknown>;
+/** Zod schemas are `unknown`-typed here; only the chainable methods we call are asserted. */
+type ZType = {
+  optional: () => unknown;
+  default: (v: unknown) => unknown;
+  meta: (m: Record<string, unknown>) => unknown;
+  describe: (d: string) => unknown;
+};
+
+/** Resolves a local JSON Pointer ref (`#/a/b/c`, incl. `~0`/`~1` escapes) against the root doc. */
+function resolveJsonPointer(root: JsonSchema, ref: string): JsonSchema | undefined {
+  if (typeof ref !== "string" || !ref.startsWith("#/")) return undefined;
+  const segments = ref
+    .slice(2)
+    .split("/")
+    .map((seg) => decodeURIComponent(seg).replace(/~1/g, "/").replace(/~0/g, "~"));
+  let node: unknown = root;
+  for (const seg of segments) {
+    if (!node || typeof node !== "object") return undefined;
+    node = (node as JsonSchema)[seg];
+  }
+  return node && typeof node === "object" ? (node as JsonSchema) : undefined;
+}
+
+/** Follows `$ref` chains (bounded, no throw) just far enough to inspect a branch's shape (e.g. for allOf merging). */
+function resolveShallow(schema: JsonSchema, root: JsonSchema): JsonSchema {
+  let cur: JsonSchema = schema;
+  const seen = new Set<string>();
+  while (typeof cur.$ref === "string") {
+    const ref = cur.$ref;
+    if (seen.has(ref)) return cur;
+    seen.add(ref);
+    const next = resolveJsonPointer(root, ref);
+    if (!next) return cur;
+    cur = next;
+  }
+  return cur;
+}
+
+function applyStringFormat(base: unknown, format: string): unknown {
+  const s = base as { email?: Function; uuid?: Function; url?: Function; datetime?: Function };
+  try {
+    switch (format) {
+      case "email":
+        return typeof s.email === "function" ? s.email() : undefined;
+      case "uuid":
+        return typeof s.uuid === "function" ? s.uuid() : undefined;
+      case "url":
+      case "uri":
+        return typeof s.url === "function" ? s.url() : undefined;
+      case "date-time":
+        return typeof s.datetime === "function" ? s.datetime() : undefined;
+      default:
+        return undefined;
+    }
+  } catch {
+    return undefined;
+  }
+}
+
+function buildAllOf(branches: unknown[], root: JsonSchema, refStack: Set<string>): unknown {
+  const resolved = branches.map((b) =>
+    b && typeof b === "object" ? resolveShallow(b as JsonSchema, root) : ({} as JsonSchema),
+  );
+  const allObjects = resolved.every((b) => b.type === "object" || (b.properties && !b.type));
+  if (allObjects) {
+    const mergedProps: JsonSchema = {};
+    const mergedRequired = new Set<string>();
+    for (const b of resolved) {
+      if (b.properties && typeof b.properties === "object") {
+        Object.assign(mergedProps, b.properties as JsonSchema);
+      }
+      if (Array.isArray(b.required)) {
+        for (const r of b.required) if (typeof r === "string") mergedRequired.add(r);
+      }
+    }
+    return jsonSchemaToZodType(
+      { type: "object", properties: mergedProps, required: [...mergedRequired] },
+      root,
+      refStack,
+    );
+  }
+  // Branches aren't all objects (intersection would need z.intersection per-pair); fall back to
+  // the first branch and keep the rest visible to the model via meta instead of silently dropping them.
+  const core = jsonSchemaToZodType(branches[0] as JsonSchema, root, refStack);
+  try {
+    return (core as ZType).meta({ allOf: branches.slice(1) });
+  } catch {
+    return core;
+  }
+}
+
+function buildObjectType(schema: JsonSchema, root: JsonSchema, refStack: Set<string>, handled: Set<string>): unknown {
+  const propsRaw = schema.properties;
+  const props = propsRaw && typeof propsRaw === "object" ? (propsRaw as JsonSchema) : {};
+  if (propsRaw !== undefined) handled.add("properties");
+  const requiredRaw = schema.required;
+  if (Array.isArray(requiredRaw)) handled.add("required");
+  const required = new Set(
+    Array.isArray(requiredRaw) ? requiredRaw.filter((x): x is string => typeof x === "string") : [],
+  );
+  const shape: Record<string, unknown> = {};
+  for (const [key, propSchema] of Object.entries(props)) {
+    let field = jsonSchemaToZodType(propSchema as JsonSchema, root, refStack);
+    if (!required.has(key)) field = (field as ZType).optional();
+    shape[key] = field;
+  }
+  let obj = z.object(shape as Record<string, never>) as unknown;
+  const additional = schema.additionalProperties;
+  if (additional === false) {
+    handled.add("additionalProperties");
+  } else if (additional === true) {
+    handled.add("additionalProperties");
+    const passthrough = (obj as { passthrough?: Function }).passthrough;
+    if (typeof passthrough === "function") obj = passthrough.call(obj);
+  } else if (additional && typeof additional === "object") {
+    handled.add("additionalProperties");
+    try {
+      const catchall = (obj as { catchall?: Function }).catchall;
+      if (typeof catchall === "function") {
+        obj = catchall.call(obj, jsonSchemaToZodType(additional as JsonSchema, root, refStack));
+      }
+    } catch {
+      // keep the strict object; additionalProperties schema still reaches the model via meta
+    }
+  }
+  return obj;
+}
+
+function buildArrayType(schema: JsonSchema, root: JsonSchema, refStack: Set<string>, handled: Set<string>): unknown {
+  if (Array.isArray(schema.prefixItems)) {
+    handled.add("prefixItems");
+    const items = schema.prefixItems.map((it) => jsonSchemaToZodType(it as JsonSchema, root, refStack));
+    return z.tuple(items as never);
+  }
+  if (Array.isArray(schema.items)) {
+    handled.add("items");
+    const items = schema.items.map((it) => jsonSchemaToZodType(it as JsonSchema, root, refStack));
+    return z.tuple(items as never);
+  }
+  let arr = z.array(
+    schema.items !== undefined
+      ? (handled.add("items"), jsonSchemaToZodType(schema.items as JsonSchema, root, refStack) as never)
+      : (z.any() as never),
+  ) as unknown;
+  if (typeof schema.minItems === "number") {
+    handled.add("minItems");
+    arr = (arr as { min: (n: number) => unknown }).min(schema.minItems);
+  }
+  if (typeof schema.maxItems === "number") {
+    handled.add("maxItems");
+    arr = (arr as { max: (n: number) => unknown }).max(schema.maxItems);
+  }
+  return arr;
+}
+
+function buildSingleType(
+  t: string,
+  schema: JsonSchema,
+  root: JsonSchema,
+  refStack: Set<string>,
+  handled: Set<string>,
+): unknown {
+  switch (t) {
+    case "string": {
+      let s = z.string() as unknown;
+      if (typeof schema.minLength === "number") {
+        handled.add("minLength");
+        s = (s as { min: (n: number) => unknown }).min(schema.minLength);
+      }
+      if (typeof schema.maxLength === "number") {
+        handled.add("maxLength");
+        s = (s as { max: (n: number) => unknown }).max(schema.maxLength);
+      }
+      if (typeof schema.pattern === "string") {
+        try {
+          s = (s as { regex: (r: RegExp) => unknown }).regex(new RegExp(schema.pattern));
+          handled.add("pattern");
+        } catch {
+          // invalid regex from a third-party schema; leave it to reach the model via meta
+        }
+      }
+      if (typeof schema.format === "string") {
+        const applied = applyStringFormat(s, schema.format);
+        if (applied !== undefined) {
+          s = applied;
+          handled.add("format");
+        }
+      }
+      return s;
+    }
+    case "number":
+    case "integer": {
+      let n = z.number() as unknown;
+      if (t === "integer") {
+        handled.add("integer");
+        n = (n as { int: () => unknown }).int();
+      }
+      if (typeof schema.multipleOf === "number") {
+        handled.add("multipleOf");
+        n = (n as { multipleOf: (v: number) => unknown }).multipleOf(schema.multipleOf);
+      }
+      if (typeof schema.exclusiveMinimum === "number") {
+        handled.add("exclusiveMinimum");
+        n = (n as { gt: (v: number) => unknown }).gt(schema.exclusiveMinimum);
+      } else if (schema.exclusiveMinimum === true && typeof schema.minimum === "number") {
+        handled.add("exclusiveMinimum");
+        handled.add("minimum");
+        n = (n as { gt: (v: number) => unknown }).gt(schema.minimum);
+      } else if (typeof schema.minimum === "number") {
+        handled.add("minimum");
+        n = (n as { min: (v: number) => unknown }).min(schema.minimum);
+      }
+      if (typeof schema.exclusiveMaximum === "number") {
+        handled.add("exclusiveMaximum");
+        n = (n as { lt: (v: number) => unknown }).lt(schema.exclusiveMaximum);
+      } else if (schema.exclusiveMaximum === true && typeof schema.maximum === "number") {
+        handled.add("exclusiveMaximum");
+        handled.add("maximum");
+        n = (n as { lt: (v: number) => unknown }).lt(schema.maximum);
+      } else if (typeof schema.maximum === "number") {
+        handled.add("maximum");
+        n = (n as { max: (v: number) => unknown }).max(schema.maximum);
+      }
+      return n;
+    }
+    case "boolean":
+      return z.boolean();
+    case "null":
+      return z.null();
+    case "array":
+      return buildArrayType(schema, root, refStack, handled);
+    case "object":
+      return buildObjectType(schema, root, refStack, handled);
+    default:
+      return z.any();
+  }
+}
+
+function buildCore(schema: JsonSchema, root: JsonSchema, refStack: Set<string>, handled: Set<string>): unknown {
+  if (Object.prototype.hasOwnProperty.call(schema, "const")) {
+    handled.add("const");
+    return z.literal(schema.const as never);
+  }
+  if (Array.isArray(schema.enum)) {
+    handled.add("enum");
+    if (schema.enum.length === 0) return z.never();
+    const literals = schema.enum.map((v) => z.literal(v as never));
+    return literals.length === 1
+      ? literals[0]
+      : z.union(literals as [unknown, unknown, ...unknown[]] as never);
+  }
+  const oneOfKey = Array.isArray(schema.oneOf) ? "oneOf" : Array.isArray(schema.anyOf) ? "anyOf" : undefined;
+  if (oneOfKey) {
+    handled.add(oneOfKey);
+    const branches = schema[oneOfKey] as unknown[];
+    if (branches.length === 0) return z.any();
+    const options = branches.map((sub) => jsonSchemaToZodType(sub as JsonSchema, root, refStack));
+    return options.length === 1
+      ? options[0]
+      : z.union(options as [unknown, unknown, ...unknown[]] as never);
+  }
+  if (Array.isArray(schema.allOf) && schema.allOf.length > 0) {
+    handled.add("allOf");
+    return buildAllOf(schema.allOf, root, refStack);
+  }
+
+  let typeList: string[] | undefined;
+  if (Array.isArray(schema.type)) {
+    handled.add("type");
+    typeList = schema.type.filter((t): t is string => typeof t === "string");
+  } else if (typeof schema.type === "string") {
+    handled.add("type");
+    typeList = [schema.type];
+  }
+
+  let core: unknown;
+  if (typeList && typeList.length > 1) {
+    const variants = typeList.map((t) => buildSingleType(t, schema, root, refStack, handled));
+    core = z.union(variants as [unknown, unknown, ...unknown[]] as never);
+  } else if (typeList && typeList.length === 1) {
+    core = buildSingleType(typeList[0], schema, root, refStack, handled);
+  } else if (schema.properties || schema.required) {
+    core = buildObjectType(schema, root, refStack, handled);
+  } else if (schema.items !== undefined || schema.prefixItems !== undefined) {
+    core = buildArrayType(schema, root, refStack, handled);
+  } else {
+    core = z.any();
+  }
+
+  if (schema.nullable === true) {
+    handled.add("nullable");
+    core = z.union([core, z.null()] as [unknown, unknown, ...unknown[]] as never);
+  }
+  return core;
+}
+
+/**
+ * Lossless-as-possible JSON Schema → zod conversion so the model sees the same descriptions and
+ * constraints OpenCode declared. `.meta()` is Object.assign'd over the generated JSON Schema by
+ * zod, so only *untranslated* keys are passed through raw (a full raw dump would clobber
+ * generated `type`/`properties`/etc); `.describe()` is applied last so it always wins.
+ */
+function jsonSchemaToZodType(
+  schema: JsonSchema | undefined,
+  root: JsonSchema = schema ?? {},
+  refStack: Set<string> = new Set(),
+): unknown {
+  if (!schema || typeof schema !== "object") return z.any();
+
+  if (typeof schema.$ref === "string") {
+    const ref = schema.$ref;
+    if (refStack.has(ref)) return z.any().meta(schema);
+    const resolved = resolveJsonPointer(root, ref);
+    if (!resolved) return z.any().meta(schema);
+    return jsonSchemaToZodType(resolved, root, new Set(refStack).add(ref));
+  }
+
+  const handled = new Set<string>();
+  let core: unknown;
+  try {
+    core = buildCore(schema, root, refStack, handled);
+  } catch {
+    core = z.any();
+    handled.clear();
+  }
+
+  try {
+    if (Object.prototype.hasOwnProperty.call(schema, "default")) {
+      handled.add("default");
+      core = (core as ZType).default(schema.default);
+    }
+    const leftover: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(schema)) {
+      if (k === "description" || handled.has(k)) continue;
+      leftover[k] = v;
+    }
+    if (Object.keys(leftover).length > 0) core = (core as ZType).meta(leftover);
+    if (typeof schema.description === "string") core = (core as ZType).describe(schema.description);
+  } catch {
+    // core wasn't a taggable zod type (shouldn't happen, but never let this throw)
+  }
+  return core;
+}
+
+export function jsonSchemaToZodShape(schema: JsonSchema | undefined): Record<string, unknown> {
+  const root = schema && typeof schema === "object" ? schema : {};
+  const props =
+    root.properties && typeof root.properties === "object" ? (root.properties as JsonSchema) : {};
+  const required = new Set(
+    Array.isArray(root.required) ? root.required.filter((x): x is string => typeof x === "string") : [],
+  );
+  const shape: Record<string, unknown> = {};
+  for (const [key, prop] of Object.entries(props)) {
+    try {
+      let field = jsonSchemaToZodType(prop as JsonSchema, root, new Set());
+      if (!required.has(key)) field = (field as ZType).optional();
+      shape[key] = field;
+    } catch {
+      shape[key] = z.any();
+    }
+  }
+  return shape;
+}
+
 async function buildOpenCodeMcpServer(
   tools: OpenAITool[],
   pendingTools: Map<string, ParkedToolCall>,
@@ -903,7 +1269,6 @@ async function buildOpenCodeMcpServer(
 ): Promise<Record<string, unknown> | undefined> {
   try {
     const sdk = await import("@anthropic-ai/claude-agent-sdk");
-    const { z } = await import("zod");
     const createSdkMcpServer = (sdk as { createSdkMcpServer?: Function })
       .createSdkMcpServer;
     const toolFactory = (sdk as { tool?: Function }).tool;
@@ -912,83 +1277,35 @@ async function buildOpenCodeMcpServer(
       return undefined;
     }
 
-    const jsonSchemaToZodType = (
-      schema: Record<string, unknown> | undefined,
-    ): unknown => {
-      if (!schema || typeof schema !== "object") return z.any();
-
-      if (Array.isArray(schema.enum) && schema.enum.length > 0) {
-        const literals = schema.enum.map((v) => z.literal(v as never));
-        return literals.length === 1
-          ? literals[0]
-          : z.union(literals as [unknown, unknown, ...unknown[]] as never);
-      }
-      if (Array.isArray(schema.anyOf) && schema.anyOf.length > 0) {
-        const options = schema.anyOf.map((sub) =>
-          jsonSchemaToZodType(sub as Record<string, unknown>),
-        );
-        return options.length === 1
-          ? options[0]
-          : z.union(options as [unknown, unknown, ...unknown[]] as never);
-      }
-
-      switch (schema.type) {
-        case "string":
-          return z.string();
-        case "number":
-        case "integer":
-          return z.number();
-        case "boolean":
-          return z.boolean();
-        case "array":
-          return z.array(
-            jsonSchemaToZodType(
-              schema.items as Record<string, unknown> | undefined,
-            ) as never,
-          );
-        case "object":
-          return z.object(
-            jsonSchemaToZodShape(schema) as Record<string, never>,
-          );
-        default:
-          return z.any();
-      }
-    };
-
-    const jsonSchemaToZodShape = (
-      schema: Record<string, unknown> | undefined,
-    ): Record<string, unknown> => {
-      const props =
-        schema &&
-        typeof schema === "object" &&
-        schema.properties &&
-        typeof schema.properties === "object"
-          ? (schema.properties as Record<string, unknown>)
-          : {};
-      const required = new Set(
-        Array.isArray(schema?.required)
-          ? schema!.required.filter((x): x is string => typeof x === "string")
-          : [],
-      );
-      const shape: Record<string, unknown> = {};
-      for (const [key, prop] of Object.entries(props)) {
-        let field = jsonSchemaToZodType(prop as Record<string, unknown>);
-        if (!required.has(key)) {
-          field = (field as { optional: () => unknown }).optional();
-        }
-        shape[key] = field;
-      }
-      return shape;
-    };
-
     const mcpTools = tools
       .map((t) => {
         const name = t.function?.name;
         if (!name) return null;
         const description = t.function?.description || name;
-        const shape = jsonSchemaToZodShape(
-          t.function?.parameters as Record<string, unknown> | undefined,
-        );
+        let shape: Record<string, unknown>;
+        try {
+          shape = jsonSchemaToZodShape(t.function?.parameters as JsonSchema | undefined);
+        } catch (err) {
+          log.warn(
+            `[opencode-claude] failed to convert schema for tool "${name}"; disabling it`,
+            err instanceof Error ? err.message : err,
+          );
+          return null;
+        }
+        try {
+          log.info(
+            "tool schema roundtrip",
+            name,
+            JSON.stringify(t.function?.parameters ?? {}),
+            JSON.stringify(z.toJSONSchema(z.object(shape as Record<string, never>))),
+          );
+        } catch (err) {
+          log.info(
+            "tool schema roundtrip (roundtrip failed)",
+            name,
+            err instanceof Error ? err.message : err,
+          );
+        }
         return toolFactory(
           name,
           description,
