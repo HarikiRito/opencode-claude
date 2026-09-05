@@ -442,11 +442,14 @@ async function handleChatCompletions(
     process.env.OPENCODE_CLAUDE_CWD || requestDirectory || process.cwd();
   const bridgeId = randomUUID();
   const pendingTools = new Map<string, ParkedToolCall>();
-  // Tool_use blocks are streamed one per assistant event, all before the SDK
-  // dispatches any handler, but handlers are then invoked serially — awaiting
-  // handler #1 before starting #2. Registering every block as it streams in
-  // (see registerToolUseBlocks) lets the first handler's park emit the whole
-  // batch instead of just the one tool the SDK has gotten around to calling.
+  // The SDK invokes each MCP tool handler as soon as its tool_use block
+  // finishes streaming, not after the whole message — so parking on the
+  // first handler's call would only ever emit that one tool. Instead we
+  // register every block as it streams past (registerToolUseBlocks) and
+  // park proactively on the raw stream's own message_delta/message_stop
+  // (see below), which is emitted exactly once the whole message — every
+  // block included — has finished, regardless of how the CLI chunks that
+  // same message into multiple "assistant" events for replay.
   const toolResultPromises = new Map<string, Promise<string>>();
   const toolIdQueue: string[] = [];
   let handle: ClaudeQueryHandle | null = null;
@@ -794,6 +797,7 @@ async function handleChatCompletions(
           });
         }
         registerToolUseBlocks(event);
+        if (pendingTools.size > 0 && isMessageStreamEnd(event)) notifyPark();
         yield event;
       }
     } finally {
@@ -872,6 +876,22 @@ function extractToolUseBlocks(
     });
   }
   return blocks;
+}
+
+/**
+ * message_delta/message_stop are raw Anthropic streaming-protocol events
+ * emitted exactly once per message, after every content block (text,
+ * thinking, tool_use, ...) has finished — the deterministic "no more
+ * tool_use blocks are coming for this turn" signal.
+ */
+function isMessageStreamEnd(event: unknown): boolean {
+  if (!event || typeof event !== "object") return false;
+  const e = event as Record<string, unknown>;
+  if (e.type !== "stream_event" || !e.event || typeof e.event !== "object") {
+    return false;
+  }
+  const ev = e.event as Record<string, unknown>;
+  return ev.type === "message_delta" || ev.type === "message_stop";
 }
 
 async function buildOpenCodeMcpServer(
@@ -974,17 +994,19 @@ async function buildOpenCodeMcpServer(
           description,
           shape,
           async (args: Record<string, unknown>) => {
-            // The block for this call was likely already registered (as the
-            // SDK streamed the assistant message) under Claude's own
-            // tool_use id, queued in dispatch order. Reuse it so the park
-            // response carries every id from the batch, not just this one.
+            // The block for this call was already registered (as the SDK
+            // streamed the assistant message) under Claude's own tool_use
+            // id, queued in dispatch order. The SDK invokes handlers the
+            // moment each block finishes streaming — long before sibling
+            // blocks do — so parking here would only ever emit this one
+            // call. Just await it; isMessageStreamEnd parks the whole
+            // batch once the stream itself says no more blocks are coming.
             const queuedId = toolIdQueue.shift();
             const resultPromise = queuedId
               ? toolResultPromises.get(queuedId)
               : undefined;
             if (queuedId && resultPromise) {
               toolResultPromises.delete(queuedId);
-              onPark();
               const result = await resultPromise;
               return { content: [{ type: "text", text: result }] };
             }
