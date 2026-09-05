@@ -410,8 +410,12 @@ async function handleChatCompletions(
         pending: existing.pendingTools.size,
         resolved,
       });
+      // Snapshot now, not inside the generator — the generator body only
+      // runs once the response starts streaming, and a concurrent resume
+      // request can fully drain existing.pendingTools before then.
+      const parkedTools = [...existing.pendingTools.values()];
       const parkedEvents = (async function* () {
-        yield { type: "__park__", tools: [...existing!.pendingTools.values()] };
+        yield { type: "__park__", tools: parkedTools };
       })();
       return stream
         ? streamOpenAIResponse(parkedEvents, body.model || model, existing)
@@ -438,9 +442,34 @@ async function handleChatCompletions(
     process.env.OPENCODE_CLAUDE_CWD || requestDirectory || process.cwd();
   const bridgeId = randomUUID();
   const pendingTools = new Map<string, ParkedToolCall>();
+  // The SDK invokes each MCP tool handler as soon as its tool_use block
+  // finishes streaming, not after the whole message — so parking on the
+  // first handler's call would only ever emit that one tool. Instead we
+  // register every block as it streams past (registerToolUseBlocks) and
+  // park proactively on the raw stream's own message_delta/message_stop
+  // (see below), which is emitted exactly once the whole message — every
+  // block included — has finished, regardless of how the CLI chunks that
+  // same message into multiple "assistant" events for replay.
+  const toolResultPromises = new Map<string, Promise<string>>();
+  const toolIdQueue: string[] = [];
   let handle: ClaudeQueryHandle | null = null;
   let parked = false;
   let parkWaiters: Array<() => void> = [];
+
+  const registerToolUseBlocks = (event: unknown): void => {
+    for (const block of extractToolUseBlocks(event)) {
+      if (pendingTools.has(block.id)) continue;
+      let resolveFn!: (result: string) => void;
+      let rejectFn!: (error: Error) => void;
+      const promise = new Promise<string>((resolve, reject) => {
+        resolveFn = resolve;
+        rejectFn = reject;
+      });
+      pendingTools.set(block.id, { ...block, resolve: resolveFn, reject: rejectFn });
+      toolResultPromises.set(block.id, promise);
+      toolIdQueue.push(block.id);
+    }
+  };
 
   const notifyPark = () => {
     parked = true;
@@ -544,7 +573,13 @@ async function handleChatCompletions(
 
   const mcpServers =
     !isMetaRequest && openCodeTools.length > 0
-      ? await buildOpenCodeMcpServer(openCodeTools, pendingTools, notifyPark)
+      ? await buildOpenCodeMcpServer(
+          openCodeTools,
+          pendingTools,
+          toolResultPromises,
+          toolIdQueue,
+          notifyPark,
+        )
       : undefined;
 
   const bridgeOpenCodeTools = !isMetaRequest && openCodeTools.length > 0;
@@ -724,13 +759,13 @@ async function handleChatCompletions(
 
         if (raced.kind === "park" || (parked && pendingTools.size > 0)) {
           parkControl.cancel?.();
-          await Promise.resolve();
           // The iterator's pending next() may already have consumed the
           // assistant event that carries the parked tool call (and its
           // per-call usage). Forward it before parking so usage accounting
           // and session binding stay intact.
+          let pendingEvent: unknown;
           if (raced.kind === "event" && !raced.value.done) {
-            const pendingEvent = raced.value.value;
+            pendingEvent = raced.value.value;
             const pendingSessionId = extractSessionId(pendingEvent);
             if (pendingSessionId) {
               setForeignSessionId(conversationKey, pendingSessionId, {
@@ -738,9 +773,16 @@ async function handleChatCompletions(
                 cwd,
               });
             }
-            yield pendingEvent;
+            registerToolUseBlocks(pendingEvent);
           }
-          yield { type: "__park__", tools: [...pendingTools.values()] };
+          // Snapshot synchronously, right here — a concurrent resume request
+          // for this same bridge can drain pendingTools between this check
+          // and a later await, and yielding an empty batch with
+          // finish_reason "tool_calls" desyncs OpenCode's agent loop into
+          // silently re-issuing the same tool calls forever.
+          const parkedTools = [...pendingTools.values()];
+          if (pendingEvent !== undefined) yield pendingEvent;
+          yield { type: "__park__", tools: parkedTools };
           return;
         }
 
@@ -754,6 +796,8 @@ async function handleChatCompletions(
             cwd,
           });
         }
+        registerToolUseBlocks(event);
+        if (pendingTools.size > 0 && isMessageStreamEnd(event)) notifyPark();
         yield event;
       }
     } finally {
@@ -797,9 +841,64 @@ function extractSessionId(event: unknown): string | null {
   return null;
 }
 
+/** Matches the MCP server name registered in buildOpenCodeMcpServer. */
+const OPENCODE_MCP_TOOL_PREFIX = "mcp__opencode__";
+
+/**
+ * The Agent SDK streams one assistant event per completed content block, so a
+ * turn with N parallel tool_use requests arrives as N separate events sharing
+ * a message id, all before the SDK starts invoking any handler.
+ */
+function extractToolUseBlocks(
+  event: unknown,
+): Array<{ id: string; name: string; arguments: string }> {
+  if (!event || typeof event !== "object") return [];
+  const e = event as Record<string, unknown>;
+  if (e.type !== "assistant") return [];
+  const message = e.message as Record<string, unknown> | undefined;
+  const content = message?.content;
+  if (!Array.isArray(content)) return [];
+  const blocks: Array<{ id: string; name: string; arguments: string }> = [];
+  for (const block of content) {
+    if (!block || typeof block !== "object") continue;
+    const b = block as Record<string, unknown>;
+    if (b.type !== "tool_use" || typeof b.id !== "string") continue;
+    const rawName = typeof b.name === "string" ? b.name : "";
+    blocks.push({
+      id: b.id,
+      // Claude names MCP tool_use blocks by their fully-qualified MCP id
+      // (mcp__<server>__<tool>); OpenCode registered the bare tool name and
+      // won't recognize the qualified form when we report the call back.
+      name: rawName.startsWith(OPENCODE_MCP_TOOL_PREFIX)
+        ? rawName.slice(OPENCODE_MCP_TOOL_PREFIX.length)
+        : rawName,
+      arguments: JSON.stringify(b.input ?? {}),
+    });
+  }
+  return blocks;
+}
+
+/**
+ * message_delta/message_stop are raw Anthropic streaming-protocol events
+ * emitted exactly once per message, after every content block (text,
+ * thinking, tool_use, ...) has finished — the deterministic "no more
+ * tool_use blocks are coming for this turn" signal.
+ */
+function isMessageStreamEnd(event: unknown): boolean {
+  if (!event || typeof event !== "object") return false;
+  const e = event as Record<string, unknown>;
+  if (e.type !== "stream_event" || !e.event || typeof e.event !== "object") {
+    return false;
+  }
+  const ev = e.event as Record<string, unknown>;
+  return ev.type === "message_delta" || ev.type === "message_stop";
+}
+
 async function buildOpenCodeMcpServer(
   tools: OpenAITool[],
   pendingTools: Map<string, ParkedToolCall>,
+  toolResultPromises: Map<string, Promise<string>>,
+  toolIdQueue: string[],
   onPark: () => void,
 ): Promise<Record<string, unknown> | undefined> {
   try {
@@ -812,6 +911,49 @@ async function buildOpenCodeMcpServer(
       log.warn("[opencode-claude] SDK MCP helpers unavailable; OpenCode tools disabled");
       return undefined;
     }
+
+    const jsonSchemaToZodType = (
+      schema: Record<string, unknown> | undefined,
+    ): unknown => {
+      if (!schema || typeof schema !== "object") return z.any();
+
+      if (Array.isArray(schema.enum) && schema.enum.length > 0) {
+        const literals = schema.enum.map((v) => z.literal(v as never));
+        return literals.length === 1
+          ? literals[0]
+          : z.union(literals as [unknown, unknown, ...unknown[]] as never);
+      }
+      if (Array.isArray(schema.anyOf) && schema.anyOf.length > 0) {
+        const options = schema.anyOf.map((sub) =>
+          jsonSchemaToZodType(sub as Record<string, unknown>),
+        );
+        return options.length === 1
+          ? options[0]
+          : z.union(options as [unknown, unknown, ...unknown[]] as never);
+      }
+
+      switch (schema.type) {
+        case "string":
+          return z.string();
+        case "number":
+        case "integer":
+          return z.number();
+        case "boolean":
+          return z.boolean();
+        case "array":
+          return z.array(
+            jsonSchemaToZodType(
+              schema.items as Record<string, unknown> | undefined,
+            ) as never,
+          );
+        case "object":
+          return z.object(
+            jsonSchemaToZodShape(schema) as Record<string, never>,
+          );
+        default:
+          return z.any();
+      }
+    };
 
     const jsonSchemaToZodShape = (
       schema: Record<string, unknown> | undefined,
@@ -830,16 +972,7 @@ async function buildOpenCodeMcpServer(
       );
       const shape: Record<string, unknown> = {};
       for (const [key, prop] of Object.entries(props)) {
-        const type =
-          prop && typeof prop === "object"
-            ? (prop as { type?: unknown }).type
-            : undefined;
-        let field: unknown = z.any();
-        if (type === "string") field = z.string();
-        else if (type === "number" || type === "integer") field = z.number();
-        else if (type === "boolean") field = z.boolean();
-        else if (type === "array") field = z.array(z.any());
-        else if (type === "object") field = z.record(z.string(), z.any());
+        let field = jsonSchemaToZodType(prop as Record<string, unknown>);
         if (!required.has(key)) {
           field = (field as { optional: () => unknown }).optional();
         }
@@ -861,6 +994,23 @@ async function buildOpenCodeMcpServer(
           description,
           shape,
           async (args: Record<string, unknown>) => {
+            // The block for this call was already registered (as the SDK
+            // streamed the assistant message) under Claude's own tool_use
+            // id, queued in dispatch order. The SDK invokes handlers the
+            // moment each block finishes streaming — long before sibling
+            // blocks do — so parking here would only ever emit this one
+            // call. Just await it; isMessageStreamEnd parks the whole
+            // batch once the stream itself says no more blocks are coming.
+            const queuedId = toolIdQueue.shift();
+            const resultPromise = queuedId
+              ? toolResultPromises.get(queuedId)
+              : undefined;
+            if (queuedId && resultPromise) {
+              toolResultPromises.delete(queuedId);
+              const result = await resultPromise;
+              return { content: [{ type: "text", text: result }] };
+            }
+
             const id = `call_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
             const pending: ParkedToolCall = {
               id,
@@ -869,14 +1019,14 @@ async function buildOpenCodeMcpServer(
               resolve: () => {},
               reject: () => {},
             };
-            const resultPromise = new Promise<string>((resolve, reject) => {
+            const fallbackPromise = new Promise<string>((resolve, reject) => {
               pending.resolve = resolve;
               pending.reject = reject;
             });
             // Register before notifying so the stream consumer sees the tool.
             pendingTools.set(id, pending);
             onPark();
-            const result = await resultPromise;
+            const result = await fallbackPromise;
             return {
               content: [{ type: "text", text: result }],
             };
@@ -1297,34 +1447,29 @@ function streamOpenAIResponse(
           const mapped = mapSdkEvent(event);
           if (mapped.kind === "park") {
             finishReason = "tool_calls";
-            for (let i = 0; i < mapped.tools.length; i++) {
-              const tool = mapped.tools[i];
-              send({
-                id: completionId,
-                object: "chat.completion.chunk",
-                created,
-                model,
-                choices: [
-                  {
-                    index: 0,
-                    delta: {
-                      tool_calls: [
-                        {
-                          index: i,
-                          id: tool.id,
-                          type: "function",
-                          function: {
-                            name: tool.name,
-                            arguments: tool.arguments,
-                          },
-                        },
-                      ],
-                    },
-                    finish_reason: null,
+            send({
+              id: completionId,
+              object: "chat.completion.chunk",
+              created,
+              model,
+              choices: [
+                {
+                  index: 0,
+                  delta: {
+                    tool_calls: mapped.tools.map((tool, i) => ({
+                      index: i,
+                      id: tool.id,
+                      type: "function",
+                      function: {
+                        name: tool.name,
+                        arguments: tool.arguments,
+                      },
+                    })),
                   },
-                ],
-              });
-            }
+                  finish_reason: null,
+                },
+              ],
+            });
             break;
           }
 
